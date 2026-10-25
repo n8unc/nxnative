@@ -71,6 +71,7 @@ Game-specific findings. The general host changes they led to are listed under [F
 
 General host changes first needed here; each applies to every game:
 
+- **Resolved in the host: dirty-page writes missed during upload**, with both unprotect paths covered by regression tests; the glyph-cache symptom remains unconfirmed here: [Dirty-page writes missed during upload](../../../docs/reference/nvn-objects.md#dirty-page-writes-missed-during-upload).
 - **Pipeline keys omit absent-target blend and mask state**, and old prewarm rows are normalized and deduplicated: [Pipeline keys omit unused colour state](../../../docs/reference/shaders.md#pipeline-keys-omit-unused-colour-state).
 - **Bounded upload staging and retirement on upload completion:** [Upload staging grows within one rendering submission](../../../docs/reference/memory.md#upload-staging-grows-within-one-rendering-submission).
 - **Resolved: registry lock priority inversion** (`g_rmu`): [Registry lock priority inheritance](../../../docs/reference/frame-rate.md#registry-lock-priority-inheritance). Ported from MacNativeGames; checked here through the Metal registry view tests, without a new gameplay contention measurement.

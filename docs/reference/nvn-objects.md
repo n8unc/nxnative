@@ -283,6 +283,14 @@ Games read this count as a position in their own command memory and size their h
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md): probably fixed; since the pause, 12 runs (eight of them 200 s runs through the movie and title, four of 330 to 850 s) have not stalled once, where one in four used to.
 - **Note:** if a stall comes back, sample the process when its log stops growing (`sample <pid> 3`) to see where every thread waits. The crash handler writes one line with `write()` and exits if the stderr lock stays taken for 1 s, so a stall that holds that lock shows up as such.
 
+### Dirty-page writes missed during upload
+
+- **Symptom:** a CPU-written texture stays stale after later writes; letters can be missing from a glyph cache.
+- **Cause:** a protect skipped a page another thread was unprotecting, leaving it writable with a generation already covered by the upload stamp. Taking the stamp after protecting, or setting the cached last-check generation after the upload, could also cover a fault whose bytes arrived after the read. Separately, an unprotect advanced the global clock before publishing the page generation: a checker could cache a clean result in between and never scan again once the page became writable. Both the page-fault path and batched host pre-write path had that publication window.
+- **Fix:** take the stamp before protecting and reading, and start the last-check generation at that stamp. Finish any pending protection run before waiting for a BUSY page, then retry that page. Both unprotect paths use `stamp_page` to publish the page generation and advance the global clock once more afterward, invalidating checks that ran before publication. These are general tracker and cache rules, with no game-specific gate.
+- **Found on:** [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), reported in MacNativeGames commit `a166602` and ported through [PR #197](https://github.com/seedds/nxnative/pull/197). The missing-letter symptom has not been reproduced in nxnative; the tracker failures are reproduced locally by the regression tests.
+- **Check:** `t_dirty_race` covers the BUSY-page retry, stamp ordering, and a check between clock allocation and generation publication in both unprotect paths. The publication cases fail on main; the batched case also fails with the original PR applied.
+
 ## NVN entry points
 
 ### Version and capability checks that fail quietly
