@@ -63,6 +63,7 @@ General host changes first needed here; each applies to every game:
 
 - **UE 5.6's 32-slot FMalloc** (`hle_uemalloc.c` layout `UE5_6`): [Unreal's FMallocBinned3 replaced by the host allocator](../../../docs/reference/memory.md#unreals-fmallocbinned3-replaced-by-the-host-allocator).
 - **IoStore shader libraries read through the game's own Oodle with no boot** (`uepak.py` `Toc`, `io_archive`, `OodleHost`, `DM_OODLE_SERVE`): [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content), [Unreal Engine 5.6 IoStore shader libraries](../../../docs/reference/shaders.md#unreal-engine-56-iostore-shader-libraries).
+- **5 ms device callbacks on the Mac** (`hle_audio.c` `au_create`): its 6-channel output keeps 3 × 240 frames in flight, and the Mac's default 512-frame callback padded 16 frames with zeros every 8th call (constant stutter): [The Mac output device's default 512-frame callback](../../../docs/reference/audio.md#the-mac-output-devices-default-512-frame-callback).
 - **Rewriter:** text before the first FDE as one function (`func_of`) and long functions analysed in pieces (`pieces`): [Code before the first unwind entry is one function](../../../docs/reference/rewriter.md#code-before-the-first-unwind-entry-is-one-function), [Long functions analysed in pieces](../../../docs/reference/rewriter.md#long-functions-analysed-in-pieces).
 
 ## Open

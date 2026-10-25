@@ -120,6 +120,14 @@ The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
 - **Fix:** `AVAudioSession` `setPreferredIOBufferDuration:0.005` (and 48 kHz) before the game opens audio and again on return to the foreground (`front_ios_audio_session` in `front_ios.m`); the device then calls back with 240 frames and nothing underruns.
 - **Check:** when checking a new device, read the host's `audio #N device callbacks` line, logged every 2000 callbacks: frames per callback, queued blocks, underruns.
 
+### The Mac output device's default 512-frame callback
+
+- **Symptom:** sound that stutters all the time on the Mac with `DM_AUDIO=1`; the output's callback line reads `512–512 frames each, 3.0 blocks queued on average at callback; in these 2000, 250 underruns, 83.3 ms zero-padded`.
+- **Cause:** the Mac's default output device calls back with 512 frames (10.7 ms), and the host left it there. FINAL FANTASY RESONANCE's 6-channel output keeps exactly 3 buffers of 240 frames (5 ms, 2,880 bytes) in flight, 720 frames: each callback takes two buffers and 32 frames of the third, so on every 8th callback only 496 frames were queued and 16 frames were padded with zeros, about 12 gaps a second. Its 2-channel CRIWARE output (2 buffers of 1,024 frames) never underran.
+- **Fix:** `au_create` (`hle_audio.c`) asks the device for 240-frame (5 ms) callbacks on the Mac, as iOS does through `front_ios_audio_session`; the log says `audio #N device buffer frame count set to 240`. `DM_DBG_AU_FRAMES=N` still asks N instead.
+- **Check:** a 50 s muted run (`DM_AUDIO=1 DM_AUDIO_MUTE=1`) from the title went from 250 underruns in every 2000 callbacks to none in 8,000, on both outputs.
+- **Found on:** [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md).
+
 ### Interruptions that stop RemoteIO callbacks
 
 - **Symptom:** sound stays silent after Siri, an alarm, a call or another app's audio; a game whose audio thread waits for its buffers back (Wwise's poll-only output, FMOD) then waits forever.
