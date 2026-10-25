@@ -89,6 +89,22 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 
 ## CPU cost and pacing
 
+### Arena buffer ownership on allocation
+
+- **Symptom:** autorelease work takes a measurable share of replay time, with temporary arena-buffer ownership traffic a few times per draw.
+- **Cause:** under ARC an unqualified `id<MTLBuffer> *` out-parameter is `__autoreleasing`, so assigning the arena buffer in `arena_alloc` autoreleases it. Reading `buf.length` also sends an Objective-C message on each allocation and while selecting or trimming arenas.
+- **Fix:** both declarations of `arena_alloc` use a `__strong` buffer out-parameter, matching every caller's strong local. `NvArena` caches its buffer length when created; allocation, reuse selection and idle trimming use that value. Buffer ownership and fence-based reuse remain the same.
+- **Found on:** MacNativeGames commit `0531f28`, ported in [PR #195](https://github.com/seedds/nxnative/pull/195), reports autorelease work falling from 2.63% to 1.73% of replay time; the PR does not identify the game for that measurement. It has not been repeated here.
+- **Check:** `t_ub`, `t_vbuf` and `t_geometry` exercise arena-backed uniform shadows, vertex conversion and geometry scratch on the Mac with Metal validation.
+
+### Registry lock priority inheritance
+
+- **Symptom:** the submit thread waits on the texture / sampler registry lock while a lower-priority registration thread is preempted holding it.
+- **Cause:** game threads register textures and samplers under `g_rmu`, which the submit thread also takes for argument encoding. The previous mutex allowed those owners to delay the higher-priority submitter.
+- **Fix:** `g_rmu` is an `os_unfair_lock`, lending a waiter's priority to its owner. All registration, lookup, cache, diagnostic and test callers use its lock API; the critical sections and lock order stay the same.
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), measured upstream in MacNativeGames commit `5f5de5e` and ported in [PR #195](https://github.com/seedds/nxnative/pull/195): in a shrine, game threads at priority 46 delayed the submit thread at priority 97 by about 1.8 ms a frame. Waiting fell from 155 to about 0 ms/s there, with unchanged frame time. Those game measurements have not been repeated here.
+- **Check:** `t_stencil_view`, `t_view_levels` and `t_view_swizzle` exercise production registry lookups and cached views with the new lock on the Mac.
+
 ### Submissions handed to the GPU in segments
 
 - **Symptom:** the GPU sits idle each frame while the host translates the submission (a game that does not submit frame N+1 until frame N's GPU work is done).
