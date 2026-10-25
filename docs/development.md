@@ -196,6 +196,27 @@ Why the host is a child process: macOS privacy checks (TCC) cover files on remov
 
 Signing: `pack_app.py` signs the inner host first, then the bundle (`codesign --force --sign <identity>`). It signs ad-hoc by default; `--mac-sign "<identity>"` (`MAC_SIGN` in Spyder) names a Developer ID or another identity. It never uses the hardened runtime: `--options runtime` refuses the executable memory the host maps for the game's code. Notarization needs the hardened runtime, so the app is not notarized. Gatekeeper blocks it on a Mac it was downloaded to until it is allowed in System Settings › Privacy & Security. `dm/tools/tests/test_nsp_mac_app.py` tests the packer and the launcher with a stand-in host, without game files.
 
+## Modding Unreal Engine games
+
+The host serves the game's RomFS, so a mod needs no loader in the game: `DM_ROMFS_OVERLAY=<folder>` makes the host look up every RomFS path in that folder first (`hle_fs.c`; several folders separated by `:`, the first wins; directory listings are merged). A file there replaces the game's file of the same path, and every other path is read from the RomFS as before. In the log, the RomFS mount line ends with `(overlay first)`. In the Mac app, put the line in `env.txt` in the game's Application Support folder (`~/Library/Application Support/nxnative/<title ID>/env.txt`), with the path written as is, without quotes.
+
+An Unreal Engine game keeps nearly everything in a few large files: paks (`.pak`: configs, localization, fonts, sound banks) and, from UE 5, IoStore containers (`.utoc` / `.ucas`: the cooked packages, `.uasset` and the rest). `scripts/ue_mod.py` (library `dm/tools/ue_files.py`) works with a build folder that the NSP script made (`<NSP folder>/<title ID>_build`; a `--platform mac` or `mac-app` build has everything it needs). Paths are from the RomFS root, as the game sees them:
+
+```
+python3 scripts/ue_mod.py list    "<NSP folder>/<id>_build" 'Config/|Datatable/'           # every file in the paks and containers, and which holds it
+python3 scripts/ue_mod.py extract "<NSP folder>/<id>_build" 'DefaultEngine.ini$' mod-src   # the files, decoded, under mod-src/<path>
+python3 scripts/ue_mod.py text    "<NSP folder>/<id>_build" en 'Crimson Saber'             # localized strings: namespace, key, text
+python3 scripts/ue_mod.py pack    "<NSP folder>/<id>_build" my-mod my-overlay              # my-mod/<path> → patched paks and containers in my-overlay
+```
+
+- `extract` decodes Oodle with the game's own decoder, through the Mac host's tool mode (`tools/dmhost` with `patched_<version>`; no boot). Zlib, LZ4 and stored data need no host.
+- `pack` takes each file under the mod folder at its game path, finds the pak or container that holds it (every copy, when several do), and writes a patched copy of that pak or container into the overlay folder. A patched copy is an APFS clone of the game's file with the new data appended and a new index after it. On the same volume as the build it takes no space of its own, and packing takes about a second. A file that no pak or container holds stops it, unless `--add-to <pak path>` names the pak that takes it. Adding a new package to a container is not supported.
+- Supported: pak version 11 (UE 4.26 to 5.x) without an encrypted index, and IoStore containers of one partition, neither encrypted nor signed. A replaced chunk keeps its old hash, and FINAL FANTASY RESONANCE's engine does not check it.
+- Cooked packages store their properties unversioned: values in the order of the type's fields, with no names. `ue_files.py` reads the parts every package shares: the Zen package summary (60 bytes in UE 5.6, 52 before), the name map (CityHash64 of each lowercased name), the export map, and unversioned property headers (`unversioned_header`). Editing a table's rows takes that table's layout, worked out from the bytes; the game's note says what was found. `text_invariant` writes a culture-invariant `FText`, a fixed string shown in every language, which needs no string table or `.locres` entry.
+- The overlay holds copies of one game version's files. A mod is made again for another version. A save that holds a modded item may not load the same way without the mod.
+
+Worked on [FINAL FANTASY RESONANCE](../dm/games/0100606026F12000/README.md#modding): 100% render resolution (a config in the pak), a weapon renamed by its table row, and a new weapon sold in a shop (two tables in the container). `dm/tools/tests/test_ue_mod.py` tests the formats and `pack` on synthetic files.
+
 ## Build and run on a device with Xcode
 
 With an Apple developer account, Xcode can sign and install the app itself:
@@ -345,6 +366,7 @@ Each game's notes are in its profile folder, `dm/games/<id>/README.md`: what the
 | `insn_census.py` | Counts the instruction sites the rewriter must handle |
 | `nso_code.py` | Function ranges from `.eh_frame` and the data blocks in a text segment, which the rewriter and the census leave out |
 | `nso_syms.py` | Compares the SDK import surface of two games, or of one game (`-` for the reference) with the host hooks |
+| `ue_files.py` | Unreal Engine files for mods: writes and patches paks, lists and patches IoStore containers, reads Zen packages, unversioned property headers and `.locres` (used by `scripts/ue_mod.py`; [Modding Unreal Engine games](#modding-unreal-engine-games)) |
 | `nro_collect.py` | The NRO modules a game registers in its NRRs, found as loose files, among an indexed archive's current files (`data.arc`) or by a scan, written out for the rewriter with `nro.tsv`; online SDKs are listed as refused |
 | `nvn_slots_got.py` | Builds the NVN fetch table and call sites (GOT-indirect loaders) |
 | `loader_census.py` | Which of the functions a name loader fetches (glad's GL loader over `eglGetProcAddress`, NVN's C proc loader) the code really calls: the GOT slots or globals the loader stores, loaded by other code (followed through registers, relocated GOT entries and `csel`, for LÖVE's glad) |

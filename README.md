@@ -175,6 +175,8 @@ The IPA appears in the same folder (here `~/Games/MarioWonder/SMBWMobile.ipa`). 
 
 To play on a Mac with Apple silicon instead, `--platform mac-app` packs a Mac app of the game that you open from Finder ([A Mac app](docs/development.md#a-mac-app)).
 
+Unreal Engine games can be modded from the same build folder: `scripts/ue_mod.py` extracts the game's configs, tables and text, and packs edited files into a folder the game reads first ([Modding Unreal Engine games](docs/development.md#modding-unreal-engine-games)).
+
 With an Apple developer account you can instead build and install from Xcode: `--prepare-xcode` makes an Xcode project for the game rather than an IPA ([Build and run on a device with Xcode](docs/development.md#build-and-run-on-a-device-with-xcode)).
 
 ## Play
