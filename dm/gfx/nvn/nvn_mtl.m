@@ -1508,7 +1508,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[113];
+static int g_red_once[120];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -1688,7 +1688,7 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
-    if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048 || t->d.levels > 15) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
+    if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.pixelFormat = (MTLPixelFormat)pf;
     d.width = t->d.width ? t->d.width : 1; d.height = t->d.height ? t->d.height : 1; d.depth = 1; d.arrayLength = 1;
@@ -1710,6 +1710,27 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
         case 9: d.textureType = MTLTextureType2DArray; d.arrayLength = t->d.depth; break;
         case 10: RED_ONCE(1, "buffer textures (TARGET_BUFFER) not implemented"); return nil;
         default: d.textureType = MTLTextureType2D; break;
+    }
+    // Fields NVN takes that Metal refuses: Metal aborts the process on them (-[MTLTextureDescriptorInternal validateWithDevice:]). An array or 3D texture of no layers gets one; one of
+    // more than 2048 is not made. More levels than the size holds (on NVN the extra ones are 1x1; a mod's 1x1 texture declaring 9, MacNativeGames f864eb0): made with the levels the
+    // size holds, and copies to the others are skipped (tex_level_ok). A multisample texture of a sample count the GPU lacks (Apple GPUs have 2 and 4; NVN also 8 and 16), or of
+    // one sample, has no Metal form and is not made, as a texture past Metal's size limits (fewer samples would leave shaders that read sample 4 or higher reading past the texture)
+    if (d.depth < 1) d.depth = 1;
+    if (d.arrayLength < 1) d.arrayLength = 1;
+    if (d.arrayLength > 2048) { RED_ONCE(113, "texture of %lu layers exceeds Metal's 2048: not made (format %#x target %d, first case ser=%llu)", (unsigned long)d.arrayLength, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
+    NSUInteger big = MAX(d.width, d.height), fit = 1;
+    if (d.textureType == MTLTextureType3D) big = MAX(big, d.depth);
+    while (big >> fit) fit++;
+    if (d.mipmapLevelCount > fit) {
+        RED_ONCE(114, "texture %u×%u×%u declares %lu levels, its size holds %lu: made with %lu, the others are not kept (format %#x, first case ser=%llu)", t->d.width, t->d.height, t->d.depth,
+                 (unsigned long)d.mipmapLevelCount, (unsigned long)fit, (unsigned long)fit, t->d.format, (unsigned long long)t->serial);
+        d.mipmapLevelCount = fit;
+    }
+    if (d.textureType == MTLTextureType2DMultisample || d.textureType == MTLTextureType2DMultisampleArray) {
+        if (d.sampleCount < 2 || ![g_dev supportsTextureSampleCount:d.sampleCount]) {
+            RED_ONCE(115, "multisample texture of %lu samples: this GPU has no such texture, not made (format %#x, first case ser=%llu)", (unsigned long)d.sampleCount, t->d.format, (unsigned long long)t->serial);
+            return nil;
+        }
     }
     d.storageMode = MTLStorageModePrivate;   // Render targets and assets both go in GPU private storage (lossless compression available)
     d.usage = MTLTextureUsageShaderRead | (fmt_compressed(t->d.format) || packaged ? 0 : MTLTextureUsageRenderTarget)
@@ -2177,7 +2198,9 @@ static void tex_zero_fill(id<MTLTexture> mt) {
 // (the zero fill does the same), COMPRESSIBLE textures (their memory is meaningless without the compression tags), multisample, depth / stencil and sparse ones.
 // In a pool the CPU can write, the same holds for storage the game flushed (nvnMemoryPoolFlushMappedRange) before the texture's first use, when the GPU has not written it yet
 // (nvn_flushed in hle_nvn.c: Breath of the Wild's sky scattering tables, copied into their pools and flushed; without them the sky was brownish grey). DM_NVN_FLUSH_FILL=0 leaves
-// those out, as before
+// those out, as before. In a CPU_UNCACHED pool the CPU's writes reach memory with no flush, and the GPU reads that memory: what the storage holds at the texture's first use is its
+// content there too, flushed or not. Donkey Kong Country: Tropical Freeze's title logo and menu panels (ASTC 5x5, no packaged layout) sit in CPU_UNCACHED | GPU_CACHED pools
+// (flags 0x22) whose storage holds their texels at first use (the 912x512 logo: 242,374 of 376,832 bytes non-zero), never flushed; as GPU textures of zeros they were magenta
 int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
 static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-zero (stops at the first)
     uint64_t i = 0, v;
@@ -2188,13 +2211,14 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
 static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
     if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
     if (t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
-    int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0;
+    int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0, uncached = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) != 0;
     static int flush_fill = -1; if (flush_fill < 0) { const char *e = getenv("DM_NVN_FLUSH_FILL"); flush_fill = !e || atoi(e) != 0; }
-    if (!no_cpu && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
+    if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
     if (!atomic_load(&g_sub_thread_set) || !on_sub_thread() || !mem_any(t->mem, t->L.size)) return 0;   // the upload batch belongs to the submit thread
     if (pkg_upload(t, NULL, mt) != mt) return 0;
-    static uint64_t n[2]; if (n[no_cpu]++ < 4) MLOG("initial content: ser=%llu %ux%ux%u format %#x filled from its storage, %s (%llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,
-                                                    no_cpu ? "a CPU_NO_ACCESS pool's" : "flushed by the CPU before its first use", (unsigned long long)n[no_cpu]);
+    int why = no_cpu ? 0 : uncached ? 1 : 2;
+    static uint64_t n[3]; if (n[why]++ < 4) MLOG("initial content: ser=%llu %ux%ux%u format %#x filled from its storage, %s (%llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,
+                                                 (const char *[]){"a CPU_NO_ACCESS pool's", "a CPU_UNCACHED pool's", "flushed by the CPU before its first use"}[why], (unsigned long long)n[why]);
     return 1;
 }
 
@@ -2337,12 +2361,14 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!t->mem || !mtl_addr((uint64_t)t->mem, (uint64_t)t->d.width * bpb, &mb, &mo)) { RED_ONCE(37, "buffer texture storage is not in a memory pool"); return nil; }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)mb;
         NSUInteger al = [g_dev minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf];
-        // Metal reports a 16-byte alignment for texture buffer views (minimumTextureBufferAlignmentForPixelFormat), but on an Apple GPU a view at any offset that is a multiple of the element
-        // size reads the right elements (measured on an M6: R32Float views at offsets 4, 8 and 12, all 64 elements right). Unreal puts some buffer textures at 8-byte offsets in its pools
-        // (Octopath Traveler 0: offset 0x168), which used to be left as dummies. Below the element size the view stays a dummy
+        // Metal requires 16-byte alignment for texture buffer views (minimumTextureBufferAlignmentForPixelFormat), and an Apple GPU addresses such a view from the 16-byte boundary below its
+        // offset (measured on an M4 Pro: R32Float views at offsets 4, 8 and 12 read elements 0, 0 and 0 instead of 1, 2 and 3, shared and private buffers, bound directly or in an argument
+        // buffer). Unreal puts buffer textures at 4-, 8- and 12-byte offsets in its pools (Octopath Traveler 0: offset 0x168; FINAL FANTASY RESONANCE's particle data), so the view is created
+        // there and shaders read it through an aligned copy (tbuf_shadow). Writes through such a view cannot be redirected. Below the element size the view stays a dummy
         if (mo % al) {
             if (mo % (uint64_t)bpb) { RED_ONCE(38, "buffer texture offset %#llx not aligned to its %d-byte elements", (unsigned long long)mo, bpb); return nil; }
-            static int once; if (!once++) MLOG("buffer texture at pool offset %#llx, below Metal's reported %lu-byte alignment: created there (element-aligned views read correctly on Apple GPUs)", (unsigned long long)mo, (unsigned long)al);
+            if (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) RED_ONCE(119, "image buffer texture at pool offset %#llx, below Metal's %lu-byte alignment: shader writes to it land at the 16-byte boundary below", (unsigned long long)mo, (unsigned long)al);
+            static int once; if (!once++) MLOG("buffer texture at pool offset %#llx, below Metal's %lu-byte alignment: created there, read through an aligned copy (tbuf_shadow)", (unsigned long long)mo, (unsigned long)al);
         }
         MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width resourceOptions:b.resourceOptions
                                                                                          usage:MTLTextureUsageShaderRead | (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? MTLTextureUsageShaderWrite : 0)];
@@ -4850,6 +4876,62 @@ static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
     g_arch_bundle = a; g_bundle_dir = dir; [archp addObject:a];
     MLOG("pipeline archive bundled with the app: %s, %.1f MB, opened in %.1f ms", p.UTF8String, [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6);
 }
+// Metal's archive builder works in a folder of the user cache folder (com.apple.gpuarchiver/gpuarchiver-*: the captured functions, descriptors and reflection, about 0.4-5 MB).
+// The first capture after a flush makes one, and no flush, release or exit removes it, so every flush left one (456 folders, 2.5 GB on one Mac). Nothing reads it once its flush
+// has written the file: a probe that removed each after its flush took every pipeline from the files again (found by MacNativeGames, 1eff989, for MTLBinaryArchive). On the Mac the
+// folder is shared by all of the user's programs and the process keeps nothing open in it, so the first capture after a flush (g_ga_mu) lists the folder before and after its
+// compile and takes the one folder that appeared as its own; the flush removes it (and exit, when no flush came). When more than one appeared (another program's capture in the
+// same few ms) none is touched. On iOS the folder is the app's own: the start removes what earlier runs left
+static pthread_mutex_t g_ga_mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic int g_ga_seen, g_ga_recap; static NSString *g_ga_mine; static _Atomic int g_ga_said;
+static NSString *ga_dir(void) {
+    static NSString *dir; static dispatch_once_t once;
+    dispatch_once(&once, ^{ char b[PATH_MAX]; if (confstr(_CS_DARWIN_USER_CACHE_DIR, b, sizeof b)) dir = [@(b) stringByAppendingPathComponent:@"com.apple.gpuarchiver"]; });
+    return dir;
+}
+static NSSet<NSString *> *ga_list(void) {
+    NSArray<NSString *> *a = ga_dir() ? [NSFileManager.defaultManager contentsOfDirectoryAtPath:ga_dir() error:nil] : nil;
+    return [NSSet setWithArray:[a filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self BEGINSWITH 'gpuarchiver-'"]] ?: @[]];
+}
+// A compile the serializer captures, with g_arch_rw held shared: the first one after a flush notes the folder it made
+static id<MTLRenderPipelineState> ga_capture(MTL4RenderPipelineDescriptor *d, MTL4CompilerTaskOptions *o, NSError **e) {
+    // A recapture through lookup archives makes no folder at its compile (the flush makes it, ga_flushed): it takes none, or it could take another program's made meanwhile
+    if (o.lookupArchives.count) { atomic_store(&g_ga_recap, 1); return [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:o error:e]; }
+    // other compiles do not wait for the one that looks: theirs land in the same folder (at worst one made before its first listing, so none is taken and the folder stays)
+    if (!g_ser4 || atomic_load(&g_ga_seen) || pthread_mutex_trylock(&g_ga_mu)) return [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:o error:e];
+    if (atomic_load(&g_ga_seen)) { pthread_mutex_unlock(&g_ga_mu); return [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:o error:e]; }
+    NSSet<NSString *> *before = ga_list();
+    id<MTLRenderPipelineState> ps = [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:o error:e];
+    if (ps) {   // a failed compile may have captured nothing: the next capture looks again
+        NSMutableSet<NSString *> *made = [ga_list() mutableCopy]; [made minusSet:before];
+        if (made.count == 1) g_ga_mine = made.anyObject;
+        else if (made.count > 1 && atomic_fetch_add(&g_ga_said, 1) < 4) MLOG("pipeline archive: %lu new Metal build folders during the first capture since the last flush: none is removed", (unsigned long)made.count);
+        atomic_store(&g_ga_seen, 1);
+    }
+    pthread_mutex_unlock(&g_ga_mu);
+    return ps;
+}
+static void ga_remove(NSString *name) {
+    NSError *e = nil;
+    if (name && ![NSFileManager.defaultManager removeItemAtPath:[ga_dir() stringByAppendingPathComponent:name] error:&e] && atomic_fetch_add(&g_ga_said, 1) < 4)
+        MLOG("[RED] pipeline archive: Metal's build folder %s not removed (%s)", name.UTF8String, e.localizedDescription.UTF8String);
+}
+// After a flush wrote its file, with g_arch_rw held alone: its build folder goes. Bases recaptured through lookup archives (compaction) get theirs during the flush, not at
+// their compile: after such captures the one folder that appeared while it wrote (before: listed just before it) goes as well. Other flushes make none, so a folder appearing
+// then is another program's
+static void ga_flushed(NSSet<NSString *> *before) {
+    ga_remove(g_ga_mine);
+    if (atomic_exchange(&g_ga_recap, 0)) {
+        NSMutableSet<NSString *> *made = [ga_list() mutableCopy]; [made minusSet:before];
+        if (made.count == 1) ga_remove(made.anyObject);
+    }
+    g_ga_mine = nil; atomic_store(&g_ga_seen, 0);
+}
+// At exit: the folder of captures no flush wrote, unless a compile is still under way
+static void ga_exit(void) {
+    if (pthread_rwlock_trywrlock(&g_arch_rw)) return;
+    ga_remove(g_ga_mine); g_ga_mine = nil;
+    pthread_rwlock_unlock(&g_arch_rw);
+}
 static void pso4_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -4863,6 +4945,14 @@ static void pso4_init(void) {
             g_arch_q = dispatch_queue_create("dm.nvn.pso-archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
             MTL4PipelineDataSetSerializerDescriptor *sd = [MTL4PipelineDataSetSerializerDescriptor new]; sd.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
             ser = [g_dev newPipelineDataSetSerializerWithDescriptor:sd];
+            atexit(ga_exit);
+#if TARGET_OS_IPHONE
+            NSSet<NSString *> *old = ga_list();   // listed before any capture, so this run's own folder is never among them
+            if (old.count) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                int n = 0; for (NSString *name in old) n += [NSFileManager.defaultManager removeItemAtPath:[ga_dir() stringByAppendingPathComponent:name] error:nil];
+                MLOG("pipeline archive: %d of Metal's build folders left by earlier runs removed", n);
+            });
+#endif
             uint64_t t0 = bp_now(); unsigned long long bytes = 0;
             NSMutableArray<NSString *> *runf = [NSMutableArray array];
             NSArray<NSString *> *names = [[[NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]]
@@ -4899,7 +4989,10 @@ static void arch_flush(void) {
     uint64_t t0 = bp_now(); NSError *e = nil;
     int vd = atomic_exchange(&g_arch_new_vd, 0);   // exact: no compile is between capture and count while the write side is held
     NSString *path = [g_arch_dir stringByAppendingPathComponent:[NSString stringWithFormat:vd ? @"%05d.mtl4a" : @"p%05d.mtl4a", g_arch_seq++]], *tmp = [path stringByAppendingString:@".tmp"];
-    BOOL ok = [g_ser4 serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:tmp] error:&e]; pthread_rwlock_unlock(&g_arch_rw);
+    NSSet<NSString *> *ga_before = atomic_load(&g_ga_recap) ? ga_list() : nil;
+    BOOL ok = [g_ser4 serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:tmp] error:&e];
+    if (ok) ga_flushed(ga_before);
+    pthread_rwlock_unlock(&g_arch_rw);
     ok = ok && !rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
     if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); return; }
     g_arch_flush_ok = 1;
@@ -4993,13 +5086,13 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
         int recap = base && from_run && g_compact_opts && atomic_load(&g_warm_running), lk = recap || (!base && compile);
         if (lk) pthread_rwlock_rdlock(&g_arch_rw);
         if (recap) {   // compaction (see g_compact_opts): taken again through the compiler, which captures it
-            id<MTLRenderPipelineState> cb = [g_comp4 newRenderPipelineStateWithDescriptor:b compilerTaskOptions:g_compact_opts error:nil];
+            id<MTLRenderPipelineState> cb = ga_capture(b, g_compact_opts, nil);
             if (cb) { base = cb; atomic_fetch_add(&g_arch_new, 1); g_compacted++; if (vd) g_arch_new_vd++; }
         }
         if (!base) {
             if (g_arch4.count + g_arch4p.count) { g_pt_miss_n++; g_pt_miss_ns += t1 - t0; }
             if (compile) {
-                NSError *be = nil; base = [g_comp4 newRenderPipelineStateWithDescriptor:b compilerTaskOptions:nil error:&be]; job->error = be; job->compiled = 1;
+                NSError *be = nil; base = ga_capture(b, nil, &be); job->error = be; job->compiled = 1;
                 g_pt_comp_ns += bp_now() - t1;
                 if (base) { g_pb_built++; if (vd) g_arch_new_vd++; if (g_ser4) arch_note_new(); }
             }
@@ -5227,7 +5320,7 @@ static void pre_pair(NSString *vk, NSString *fk, int zero) {
         for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         NSError *e = nil;
-        pthread_rwlock_rdlock(&g_arch_rw); id ps = [g_comp4 newRenderPipelineStateWithDescriptor:m compilerTaskOptions:nil error:&e]; pthread_rwlock_unlock(&g_arch_rw);
+        pthread_rwlock_rdlock(&g_arch_rw); id ps = ga_capture(m, nil, &e); pthread_rwlock_unlock(&g_arch_rw);
         if (ps) { g_pre_built++; atomic_fetch_add(&g_arch_new, 1); }
         else { if (g_pre_failed++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s failed: %s", vk.UTF8String, fk.UTF8String, e.localizedDescription.UTF8String); }
     }
@@ -5708,6 +5801,39 @@ static id<MTLTexture> dummy_tbuf(int dpf) {   // Unbound typed buffer: all zeros
     t = [b newTextureWithDescriptor:d offset:0 bytesPerRow:b.length];
     cache[dpf & 3] = t; g_dummy_tbuf_rid[dpf & 3] = t.gpuResourceID._impl; return t;
 }
+// A buffer texture below Metal's 16-byte view alignment (tex_mtl, target BUFFER) reads from the 16-byte boundary below its offset, so a shader reads it through a copy of its bytes at an
+// aligned offset of a shared staging block, made at its first binding in each submission. FINAL FANTASY RESONANCE's particle vertex factories read their CPU-written particle data from
+// such views (village fires, smoke and muzzle flashes drawn at the wrong scale or flickering). The copy holds what the CPU wrote before the submission was encoded: a GPU write in the same
+// submission, or in one still running, is not seen, and a pool the CPU cannot access is bound as is (reported once). Caller holds g_rmu
+enum { TBS_BLOCK = 4u << 20, TBS_CACHE = 512 };
+static id<MTLBuffer> g_tbs_blk; static size_t g_tbs_off; static NSMutableArray *g_tbs_views;
+static struct { __unsafe_unretained id<MTLTexture> src, copy; uint64_t epoch, rid; } g_tbs_cache[TBS_CACHE];
+static uint64_t g_tbs_copies;
+static id<MTLTexture> tbuf_shadow(id<MTLTexture> t, uint64_t *rid) {
+    if (!t || t.textureType != MTLTextureTypeTextureBuffer) return t;
+    id<MTLTexture> root = t; while (root.parentTexture) root = root.parentTexture;   // a swizzled view keeps its parent's buffer
+    id<MTLBuffer> src = root.buffer; NSUInteger off = root.bufferOffset, row = root.bufferBytesPerRow;
+    if (!src || !(off & 15) || off >= src.length) return t;
+    if (!src.contents) { RED_ONCE(117, "buffer texture at pool offset %#lx (not 16-byte aligned) in a pool the CPU cannot access: read from the 16-byte boundary below", (unsigned long)off); return t; }
+    unsigned k = (unsigned)(((uintptr_t)(__bridge void *)t >> 4) % TBS_CACHE);
+    if (g_tbs_cache[k].src == t && g_tbs_cache[k].epoch == g_fence + 1) { *rid = g_tbs_cache[k].rid; return g_tbs_cache[k].copy; }
+    size_t n = row < src.length - off ? row : src.length - off, need = (n + 255u) & ~(size_t)255u;
+    if (!g_tbs_blk || g_tbs_off + need > g_tbs_blk.length) {   // a full block and its views are released once the submissions that read them are done
+        if (g_tbs_blk) { defer_obj_release(g_tbs_blk); defer_obj_release(g_tbs_views); }
+        g_tbs_blk = [g_dev newBufferWithLength:need > TBS_BLOCK ? need : TBS_BLOCK options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+        if (!g_tbs_blk) { RED_ONCE(118, "no staging block for buffer textures below the 16-byte alignment"); return t; }
+        res_add(g_tbs_blk); g_tbs_views = [NSMutableArray array]; g_tbs_off = 0;
+    }
+    memcpy((uint8_t *)g_tbs_blk.contents + g_tbs_off, (const uint8_t *)src.contents + off, n);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:t.pixelFormat width:t.width resourceOptions:g_tbs_blk.resourceOptions usage:MTLTextureUsageShaderRead];
+    d.swizzle = t.swizzle;
+    id<MTLTexture> c = [g_tbs_blk newTextureWithDescriptor:d offset:g_tbs_off bytesPerRow:row];
+    if (!c) { RED_ONCE(118, "cannot copy a buffer texture below the 16-byte alignment (%lu elements, format %lu)", (unsigned long)t.width, (unsigned long)t.pixelFormat); return t; }
+    g_tbs_off += need; [g_tbs_views addObject:c];
+    if (!g_tbs_copies++) MLOG("buffer texture at pool offset %#lx (not 16-byte aligned) read through an aligned copy: %lu elements, format %lu, %zu bytes (first case)", (unsigned long)off, (unsigned long)t.width, (unsigned long)t.pixelFormat, n);
+    g_tbs_cache[k].src = t; g_tbs_cache[k].copy = c; g_tbs_cache[k].epoch = g_fence + 1; g_tbs_cache[k].rid = *rid = c.gpuResourceID._impl;
+    return c;
+}
 static id<MTLSamplerState> dummy_samp(void) {
     static id<MTLSamplerState> s; if (!s) { MTLSamplerDescriptor *d = [MTLSamplerDescriptor new]; d.supportArgumentBuffers = YES; s = [g_dev newSamplerStateWithDescriptor:d]; }
     return s;
@@ -5885,6 +6011,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }   // a handle the shader does not pick here may be another kind
                 if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; } else real |= 1ull << k;
                 if (bl && tid) PD("B %llu st%d texu [%d] tid=%d %s", g_stat_pass, nvn_stage, k, tid, tv ? "real" : "dummy");
+                if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) t = tbuf_shadow(t, &trid);   // see tbuf_shadow
                 slots[aid + k] = trid;
                 USE(t, MTLResourceUsageRead);
             }
@@ -5913,6 +6040,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 else if (t.textureType == MTLTextureTypeTextureBuffer || (MTLTextureType)b->dtt == MTLTextureTypeTextureBuffer) { tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "a buffer texture: the slot reads 0 (dummy)"); t = nil; }
                 else tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "bound as is"); }
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
+            else if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) t = tbuf_shadow(t, &trid);   // see tbuf_shadow
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
@@ -5969,6 +6097,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu fmt=%#x n=%u mem=%p", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
                        tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg ? g_treg[tid].t.d.width : 0, tid < g_ntreg ? (void *)g_treg[tid].t.mem : NULL);
             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
+            else t = tbuf_shadow(t, &trid);   // see tbuf_shadow
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_TEXD) {   // dynamic handle array (profile key tex_dyn_slots): element k = the texture in slot k (combined, else separate), since c2 holds slot indices for this shader (see DRV2 below)
@@ -5979,6 +6108,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) {
                     if (t && t.textureType != MTLTextureTypeTextureBuffer) t = nil;   // a slot the shader does not pick here may hold another kind of texture
                     if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
+                    else t = tbuf_shadow(t, &trid);   // see tbuf_shadow
                 } else {
                     if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }
                     if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
@@ -5998,6 +6128,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }   // an element the shader does not pick here may be another kind
                 if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; } else real |= 1ull << k;
                 if (bl && tid) PD("B %llu st%d texa [%d] tid=%d %s", g_stat_pass, nvn_stage, k, tid, tv ? "real" : "dummy");
+                if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) t = tbuf_shadow(t, &trid);   // see tbuf_shadow
                 slots[aid + k] = trid;
                 USE(t, MTLResourceUsageRead);
             }
@@ -8300,6 +8431,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
     if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, or nothing (tf_draw)
+    // Transform feedback records every draw between Begin and End, rasterized or not: Donkey Kong Country: Tropical Freeze captures its fur's lagged positions with rasterization on
+    // (a vertex-only program, colour mask 0, `7dcdaed991c74bfe`), and its fur shells read them; the capture runs first, then the draw rasterizes as on the GPU
+    if (S.tf_on && pr && pr->sh[0] && pr->sh[0]->tf_fn) tf_draw(pr, dw, di);
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
@@ -8676,6 +8810,12 @@ static void dispatch(const p_dispatch *dp) {
     if (own) enc_c_end(ce);
 }
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, layer stride from SetCopyImageStride, 0 = tightly packed)
+// A copy at a level the host texture lacks (more levels declared than its size holds, tex_desc) is skipped: Metal does not check the level of a blit
+static int tex_level_ok(id<MTLTexture> t, NSUInteger level, const char *what) {
+    if (level < t.mipmapLevelCount) return 1;
+    RED_ONCE(116, "%s at level %lu of a texture with %lu levels: skipped (first case)", what, (unsigned long)level, (unsigned long)t.mipmapLevelCount);
+    return 0;
+}
 static void copy_t2b(const p_copy_b2t *c) {
     rp_flush();   // Materialize pending clears before reading, matching copy_t2t.
     g_wr_epoch++; g_mdx_epoch++;
@@ -8684,6 +8824,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
+    if (!tex_level_ok(t, level, "texture-to-buffer copy")) return;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * rows;   // per layer: SetCopyImageStride, else tightly packed
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
@@ -8726,7 +8867,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     // Finding: docs/reference/memory.md, GPU readback without an autorelease pool.
     @autoreleasepool {
     id<MTLTexture> mt = tex_mtl(t);
-    if (!mt) { memset(dst, 0, img * nz); return; }
+    if (!mt || !tex_level_ok(mt, level, "CPU readback")) { memset(dst, 0, img * nz); return; }
     mtl_finish_gpu_at(WS_READTEX);
     id<MTLBuffer> buf = [g_dev newBufferWithLength:wb * hb * nz options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = enc_b_begin(cb);
@@ -8743,6 +8884,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     if (!t) { PD("C ser=%llu (no host texture)", c->tex->serial); return; }
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
+    if (!tex_level_ok(t, level, "buffer-to-texture copy")) return;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * rows;   // per layer: SetCopyImageStride, else tightly packed
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
@@ -8869,6 +9011,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     if (!s || !d) return;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
+    if (!tex_level_ok(s, sl, "texture copy source") || !tex_level_ok(d, dl, "texture copy destination")) return;
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
         if (s.sampleCount == d.sampleCount && s.pixelFormat == d.pixelFormat && s.width == d.width && s.height == d.height) {
             enc_b_copy_texture(blit(), s, sz0, sl, MTLOriginMake(0, 0, 0), MTLSizeMake(s.width, s.height, 1), d, dz0, dl, MTLOriginMake(0, 0, 0));

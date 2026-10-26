@@ -363,35 +363,43 @@ def job_for(key, name, rec, w):
 
 TF_SLOT = 8   # Metal vertex buffer index of transform feedback buffer 0 (1-3 follow): slot 0 is the argument buffer, 16-29 the vertex streams, 30 the zero buffer (nvn_mtl.m tf_draw)
 def tf_layout(key, ctl):
-    """Transform feedback layout from a vertex shader's control section (what the NVN driver programs into the GPU's feedback state when the program is bound), measured on Pokémon Legends: Z-A's
-    28 skinning shaders: +0x6dc u16 stride per buffer (4 buffers), +0x6e8 u8 per-buffer enable, +0x6ec u8 buffer count and +0x6ed 1; per buffer b, +0xdc + 0x80 b holds the captured output as
-    0x20 + n (generic output n) and +0x4dc + 0x80 b a u32 component count, captured from x on. Every buffer seen holds one output (stride = 4 x count): position xyz, packed normal / tangent bits.
-    → [[output, components, stride] per buffer, [] for an unused one], None for a shader without transform feedback. Any other form gets a red line and no capture entry point (the host then
-    reports the draw, nvn_mtl.m tf_draw): it is not known how it maps, and one shader must not stop a game's build (Tears of the Kingdom and Ace Attorney have no feedback shader at all)"""
+    """Transform feedback layout from a vertex shader's control section (what the NVN driver programs into the GPU's feedback state when the program is bound): +0x6dc u16 stride per buffer
+    (4 buffers), +0x6e8 u8 per buffer the number of captured outputs, +0x6ec u8 buffer count and +0x6ed 1; per buffer b, +0xdc + 0x80 b lists the captured outputs, one byte each as 0x20 + n
+    (generic output n), and +0x4dc + 0x80 b their component counts, one byte each, each captured from x on and packed in that order (stride = 4 x the components). Pokémon Legends: Z-A's
+    28 skinning shaders capture one output per buffer (position xyz, packed normal / tangent bits); Donkey Kong Country: Tropical Freeze's fur simulation captures two in one buffer
+    (`7dcdaed991c74bfe`: outputs 0 and 1, xyz each, stride 24; count 2, component bytes 03 03).
+    → [[[[output, components], …], stride] per buffer, [] for an unused one], None for a shader without transform feedback. Any other form gets a red line and no capture entry point (the host
+    then reports the draw, nvn_mtl.m tf_draw): it is not known how it maps, and one shader must not stop a game's build (Tears of the Kingdom and Ace Attorney have no feedback shader at all)"""
     strides = struct.unpack_from('<4H', ctl, 0x6dc)
     if not any(strides): return None
     out = []
     for b in range(4):
         if not strides[b]: out.append([]); continue
-        locs = [x for x in ctl[0xdc + 0x80 * b:0x15c + 0x80 * b] if x]; n = struct.unpack_from('<I', ctl, 0x4dc + 0x80 * b)[0]
-        if ctl[0x6e8 + b] != 1 or len(locs) != 1 or not 0x20 <= locs[0] < 0x40 or not 1 <= n <= 4 or strides[b] != 4 * n:
-            print(f'[RED] {key}: transform feedback buffer {b} has a layout of unknown form (stride {strides[b]}, enable {ctl[0x6e8 + b]}, outputs {locs}, components {n}): no capture entry point; see tf_layout', flush=True)
+        k = ctl[0x6e8 + b]; locs = list(ctl[0xdc + 0x80 * b:0xdc + 0x80 * b + k]); comps = list(ctl[0x4dc + 0x80 * b:0x4dc + 0x80 * b + k])
+        if (not 1 <= k <= 4 or any(ctl[0xdc + 0x80 * b + k:0x15c + 0x80 * b]) or any(ctl[0x4dc + 0x80 * b + k:0x4e0 + 0x80 * b])
+                or not all(0x20 <= x < 0x40 for x in locs) or not all(1 <= n <= 4 for n in comps) or strides[b] != 4 * sum(comps)):
+            print(f'[RED] {key}: transform feedback buffer {b} has a layout of unknown form (stride {strides[b]}, outputs {k}: {[hex(x) for x in locs]}, components {comps}): no capture entry point; see tf_layout', flush=True)
             return None
-        out.append([locs[0] - 0x20, n, strides[b]])
+        out.append([[[x - 0x20, n] for x, n in zip(locs, comps)], strides[b]])
     return out
 
 def vs_tf(src, tf):
     """The transform feedback entry point main0_tf: the main function's body, ending in stores of the captured outputs instead of returning them. Metal has no feedback stage; the host runs this
     vertex function with rasterization off and binds buffer b (the game's feedback buffer at its current offset, less first x stride) at TF_SLOT + b, so vertex v writes at v x stride.
-    The values are stored as their bits (packed normals are integers in float outputs)"""
+    The values are stored as their bits (packed normals are integers in float outputs); a buffer's outputs follow one another within the vertex's stride, in tf_layout's order"""
     m = re.search(r'\bvertex\s+main0_out\s+main0\s*\((.*?)\)\s*\{', src, re.S)
     if not m: sys.exit('[RED] vertex shader without a main0 main function, cannot add the transform feedback entry point')
     params, body = m.group(1), src[m.end():]   # the main function is the last function in the file
     vm = re.search(r'uint\s+(\w+)\s*\[\[vertex_id\]\]', params); vid = vm.group(1) if vm else 'dm_vid'
     st = re.search(r'struct main0_out\s*\{(.*?)\};', src, re.S)
     names = {int(l): nm for nm, l in re.findall(r'float4 (\w+) \[\[user\(locn(\d+)\)\]\]', st.group(1) if st else '')}
-    stores = ''.join(f' dm_tf{b}[{vid} * {n} + {i}] = {f"as_type<uint>(out.{names[o]}.{c})" if o in names else "0u"};'
-                     for b, e in enumerate(tf) if e for o, n, _ in [e] for i, c in enumerate('xyzw'[:n]))
+    stores = ''
+    for b, e in enumerate(tf):
+        if not e: continue
+        words, at = e[1] // 4, 0
+        for o, n in e[0]:
+            stores += ''.join(f' dm_tf{b}[{vid} * {words} + {at + i}] = {f"as_type<uint>(out.{names[o]}.{c})" if o in names else "0u"};' for i, c in enumerate('xyzw'[:n]))
+            at += n
     extra = ('' if vm else ', uint dm_vid [[vertex_id]]') + ''.join(f', device uint* dm_tf{b} [[buffer({TF_SLOT + b})]]' for b, e in enumerate(tf) if e)
     return f'\nvertex void main0_tf({params}{extra})\n{{' + body.replace('return out;', '{' + stores + ' return; }')
 
@@ -885,7 +893,7 @@ def finish(key, w, j, c1):
     dr = drv_reads(src)
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
-            **({'entry_tf': 'main0_tf', 'tf_strides': [e[2] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
+            **({'entry_tf': 'main0_tf', 'tf_strides': [e[1] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
@@ -985,8 +993,10 @@ noreg = [x for x in ok if any(b['kind'] in SLOTK and b.get('reg') is None for b 
 unk = [x for x in ok if any(b['kind'] == '?' for b in x['bindings'])]
 print(f'shaders with a binding whose slot was not decoded {len(noreg)}, with an unrecognized binding kind {len(unk)} (loading them at run time prints [RED] lines)')
 for e, n in collections.Counter(f"{b['kind']} {b['msl_name'][:28]}" for x in noreg + unk for b in x['bindings'] if b['kind'] == '?' or (b['kind'] in SLOTK and b.get('reg') is None)).most_common(8): print(f'  {n:5d}  {e}')
-nt = collections.Counter(nn.split(' (')[0] for x in ok for nn in x['notes'])
+nt = collections.Counter(nn.split(' (')[0] for x in ok for nn in x['notes'] if not nn.startswith('translator: '))
 for e, n in nt.most_common(8): print(f'  queries without an answer {n:5d}  {e}')
+tm = collections.Counter(nn[len('translator: '):] for x in ok for nn in x['notes'] if nn.startswith('translator: '))   # the translator's own messages (dmsh_xlate Log): bindless reads resolved or removed, invalid encodings
+for e, n in tm.most_common(12): print(f'  translator {n:6d} in {sum(e in [nn[len("translator: "):] for nn in x["notes"]] for x in ok):5d} shaders  {e}')
 json.dump([{'key': r[0], 'st': r[1], 'err': r[2]} for r in res], open(os.path.join(out, '_b_build.json'), 'w'), ensure_ascii=False)
 if not want:   # a full build: the stamp, then the c1 guard and uniform read extent tables from these Mac outputs, into the profile folder (the host takes them only beside this stamp)
     for _d in [out] + ([IOSOUT] if IOSOUT else []): dmsh_chain.write_stamp(_d, GAME.id, INPUTS)

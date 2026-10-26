@@ -36,6 +36,13 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** a thread-local flag (`t_in_open`) hands the inner call straight to the SDK with the host's CPU / manual copy of the parameter, and only the outer call starts the thread (`hle_audren.c`).
 - **Found on:** [ROMANCE OF THE THREE KINGDOMS 8 REMAKE](../../dm/games/0100C2A01A730000/README.md) (SDK 17.5.3).
 
+### The renderer event as the service gives it: a kernel event
+
+- **Symptom:** the frame loop stops for good as a level loads while audio keeps rendering. The main thread waits in `os::WaitSystemEvent` under `CAudioMemoryPool::Shutdown`, and a sound thread of higher priority waits on the same condition variable.
+- **Cause:** with the DSP service (device 0, what the game asks for) `OpenAudioRenderer` attaches the service's renderer event, a kernel readable event (`AttachReadableHandleToSystemEvent`, auto-clear). With CPU rendering and manual execution, which the host switches to ([Running the SDK's own renderer on the CPU](#running-the-sdks-own-renderer-on-the-cpu)), it creates a local one instead (`CreateSystemEvent(event, AutoClear, false)`, SDK 4: `sdk+0x190b6c`). Signalling a local auto-clear event wakes one waiter, the one of highest priority. A kernel event wakes every waiter, and each one tries `ResetSignal`. Donkey Kong Country: Tropical Freeze waits on the event from two threads: its sound thread (priority 29, `main+0x971e8`) every frame, and the main thread while it detaches an audio memory pool (`main+0x6fa8c`: `RequestDetachMemoryPool`, then wait and update until `IsMemoryPoolAttached` is false). The sound thread took every wake, and the main thread never woke again.
+- **Fix:** when the game opened the renderer for the service, the host replaces the SDK's local event with an inter-process auto-clear one (`DestroySystemEvent`, then `hle_bind_system_event(event, 1)` in `ar_open`). The SDK's renderer signals through `os::SignalSystemEvent`, which handles either kind. A game that opens a CPU renderer itself keeps the SDK's local event.
+- **Found on:** [Donkey Kong Country: Tropical Freeze](../../dm/games/0100C1F0051B6000/README.md) (SDK 4.4.0): the first level's load after the intro cinematic.
+
 ### The renderer's update lock (`update_lock`)
 
 - **Symptom:** none of its own; command generation races the game's `Update` on SDKs whose lock is not at SDK 16's offset.
@@ -43,6 +50,13 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** `update_lock` in `hle_audren.c` reads it off the SDK's own `Update`: the register the prologue adds the offset to and moves into x0 before its first `bl`, whose PLT slot must hold `LockMutex` or `SdkMutexType::Lock`; anything else keeps SDK 16's.
 - **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.4), the first game it was plainly wrong for.
 - **Check:** checked with sound on [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (11.4, +0x1d8), [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (7.3, `MutexType` +0x1d8) and [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (7.3, which is silent for its first minute with either lock).
+
+### No `SdkMutexType` in SDK 3
+
+- **Symptom:** `FATAL audren: missing SDK symbol _ZN2nn2os12SdkMutexType4LockEv` right after the renderer's render thread starts.
+- **Cause:** the render path looked up `SdkMutexType::Lock` / `Unlock` before reading which lock the SDK's `Update` takes ([The renderer's update lock](#the-renderers-update-lock-update_lock)); SDK 3.5.1's `sdk` has no `SdkMutexType` and takes `nn::os::LockMutex` at +0x1f8.
+- **Fix:** `render_once` looks up the `SdkMutexType` functions only when `update_lock` does not find `LockMutex` (`hle_audren.c`).
+- **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md) (SDK 3.5.1), the first SDK 3 game through the audio renderer (Bayonetta 2's 3.6.0 plays through `AudioOut`).
 
 ### The render thread's route through the public `ExecuteAudioRendererRendering` (SDK 20)
 

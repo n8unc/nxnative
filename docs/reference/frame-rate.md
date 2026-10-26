@@ -157,6 +157,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), measured upstream in MacNativeGames commit `5f5de5e` and ported in [PR #195](https://github.com/seedds/nxnative/pull/195): in a shrine, game threads at priority 46 delayed the submit thread at priority 97 by about 1.8 ms a frame. Waiting fell from 155 to about 0 ms/s there, with unchanged frame time. Those game measurements have not been repeated here.
 - **Check:** `t_stencil_view`, `t_view_levels` and `t_view_swizzle` exercise production registry lookups and cached views with the new lock on the Mac.
 
+### Hash-table lookups of 8-byte keys
+
+- **Symptom:** in a replay profile, `_platform_memcmp` is most of the time spent in serial lookups (`tex_mtl` through `g_by_serial`).
+- **Cause:** `nvn_hm_get` compared each probed key with `memcmp` and the table's run-time key length, a libc call per probe. The serial, live-serial, ghost, view-cache and compute-pipeline tables have 8-byte keys and are looked up several times per draw.
+- **Fix:** for 8-byte keys `nvn_hm_get` loads the key as one word and compares words. The hash, probe order and answers are the same; puts and deletes are unchanged.
+- **Found on:** MacNativeGames commit `7431eb7` (38 of 55 samples of the serial lookup were `memcmp` in a Tears of the Kingdom profile). Here, a lookup in a 3,000-entry table of 8-byte keys takes 1.5 ns instead of 5.9 ns on an M4 Pro (`clang -O2`, 60 million lookups); no game frame has been measured.
+- **Check:** `t_hmap` checks 8- and 20-byte keys against a naive model through random puts, overwrites, deletes and clears.
+
 ### Submissions handed to the GPU in segments
 
 - **Symptom:** the GPU sits idle each frame while the host translates the submission (a game that does not submit frame N+1 until frame N's GPU work is done).
@@ -165,6 +173,7 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): a stack sample in the shrine had the main thread in `nvnSyncWait` (the fence of the frame just submitted) for 59% of the time and the render thread in `nvnQueueSubmitCommands` for 40%; the translation was about 3,600 draws and 347 passes, 7 ms, so per frame the GPU ran 13–14 ms and then sat idle 7.7 ms (`DM_NVN_TSV` rows `@gpu_beg_ms` / `@gpu_end_ms` against `@call_ms`). GPU idle per frame went from 7.7 to 3.8 ms; most of the rest is the game's own work between its fence wait and the next submit (about 2.5 ms). The other five games' frame times were unchanged; Metroid Dread's p95 dropped from 19.6 to 16.9 ms.
 - **Note:** after this, BotW's docked frame p50 was 16.7 ms (was 20.8 ms before segmenting). Host translation is 8 ms per frame (22,000 instructions per draw), spread over Metal's encoder creation and draw calls, argument encoding, Objective-C retain / release and pool lookups. The per-pass GPU timer (`DM_NVN_PASSGPU`) is switched off under Metal 4 (`pg_render` returns at once), so GPU time cannot yet be attributed to passes. Render-target traffic per frame is in `DM_NVN_TSV`'s `@rt_load_mb` / `@rt_store_mb`.
 - **Note:** with the encode thread (`DM_NVN_ENC_THREAD`) a segment's commit record is handed to it at once (`rec_publish` in `sub_cut`), not when its block of records fills. Breath of the Wild on an M2 Max (encode thread and snapshots, `DM_FPS_TARGET=120`): the frame's wait on its newest fence 12.5 ms with `DM_NVN_CUT=0`, 5.6 ms with 64, 5.35 ms with 16.
+- **Note:** MacNativeGames moved its cut to 30 draws for the first segment and 40 after (`2fa27d7`; uncapped Tears of the Kingdom in a shrine, 10.77 → 10.60 ms a frame). At this repository's 60 fps cap the size changes nothing where the GPU finishes inside the frame: Breath of the Wild outdoors on an M4 Pro (2026-10-26, the outdoor seed of the [BotW Mac routes](../../dm/games/01007EF00011E000/README.md#mac-routes), frames 3,001–5,700, cut 64) waited on its fence 0.02 ms a frame on average (`@sync_ms`), with GPU span 10.8 ms. The default stays 64; a GPU-bound device (an iPhone) is where a smaller cut could show, through `DM_NVN_CUT`.
 
 ### Address to memory pool lookups by binary search
 

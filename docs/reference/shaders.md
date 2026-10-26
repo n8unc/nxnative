@@ -28,6 +28,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** it now goes by the zstd magic (`28 b5 2f fd`) whatever the name.
 - **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) (8,726 of the RomFS's 9,959 files, the shader archives among them). Of the other 21 games' RomFS on hand only Super Mario Galaxy's `GDDR3.zst` (a Vulkan game, no NVN split) has such a file.
 
+### HAL's `.cmp` containers: a size-prefixed frame
+
+- **Symptom:** the game asks for shaders the map does not have (`[RED] shader ... is not in the shader map`, hundreds of lines), and the split finds far fewer shaders than the game uses (121 against 27,288 on Kirby and the Forgotten Land).
+- **Cause:** HAL keeps its assets in `.cmp` containers: a 4-byte little-endian uncompressed size, then a frame (zstd, or LZ4 in the `ubin/` map data). The split decompressed a zstd file by its magic at offset 0, so a frame that starts at offset 4 was read raw, and the shaders inside the BFRES archives of those containers were never seen.
+- **Fix:** the split opens a size-prefixed frame as well (`unsized`: zstd, with a dictionary as for a plain zstd file, or LZ4) when the file's bytes 4 to 8 are a frame magic and bytes 0 to 4 are not the zstd magic. A frame whose header records a size other than the prefix is not such a container, and the file is read as it is: Tears of the Kingdom's 1,202 `Cave/…/C.crbin.<hash>/*.quad` files are a 4-byte hash (the one in their folder name) and a zstd frame, the only files with a frame at +4 in the RomFS of 39 other games on hand. A frame that records no size must decompress to exactly the prefix's size; otherwise (it does not decompress, it holds more or less, or it names a dictionary `Pack/ZsDic.pack.zs` does not have) the split prints a `[RED]` line and reads the file as it is.
+- **Found on:** Kirby and the Forgotten Land (`01004D300C5AE000`, in bring-up): 7,201 `.cmp` files, 5,121 of them zstd frames with 19,364 BNSH inside (11.2 GB decompressed) and 2,080 LZ4 frames, all of the latter in `ubin/` (0.3 GB, and no BNSH); the same layout is in 430 `.cmpbin` files (76 zstd in `lyt/`, 354 LZ4 in `snd/`). Every zstd frame records its size, the same as its prefix; no LZ4 frame does, and each decompresses to its prefix's size. The split now finds 27,288 shaders in the base game (18,476 in `gfx/`, 8,313 in `ptcl/`, 378 in `lyt/`, 67 in the loose `shader` files, 54 in `main`), against 121 before, and 27,302 with update 1.1.0 (v65536: 14 more in `lyt/`).
+
 ### BNSH in Bezel Engine archives
 
 - **How it is stored:** the shaders are BNSH in the `.bfsha` entries of the `.bea` archives (zstd entries, [01](../agents/01-extract.md)), most of them the engine's own in `System.nx.bea` (`_BezelSystemResources/<system>/shader/*.bfsha`: PBR shadow maps 846, post effects 770, …), the rest in the layouts' `__ArchiveShader.bnsh` and the per-archive shader packs (`.bnbshpk`), plus one BNSH in `main`.
@@ -164,6 +171,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** the reader (`raw_shaders`) takes them. Both neighbours can pass the header and length checks, so it takes only a code area the code builds the address of, the nearest one to the control section's.
 - **Found on:** [Advance Wars 1+2: Re-Boot Camp](../../dm/games/0100300012F2A000/README.md) (Unity 2020.2 with Bink 2's Unity plugin). Of 25 `main`s on hand no other has such control sections.
 
+### SNVN program records in Retro Studios' RFRM forms
+
+- **Symptom:** the provisional split finds only `main`'s 294 GLSLC outputs; the 3D scene and the title logo are magenta, with `[RED] shader … is not in the shader map` lines.
+- **How it is stored:** Retro's files are RFRM forms (`RFRM`, big-endian u64 data length, u64, then the form type and two u32 versions; chunks inside are a fourcc, u64 length, two u32 versions, then the data). `MaterialArchive.arc` is one `MTRL` form holding an `SDX ` chunk (the same materials' D3D bytecode, 3,468 DXBC programs) and an `SNVN` chunk (the NVN ones). The `.pak` files are `PACK` forms whose `ADIR` chunk lists the resources (u32 count, then 36-byte entries: fourcc type, 16-byte GUID, big-endian u64 offset and length); each `MTRL` resource is an RFRM form whose data is one zlib stream holding another `MTRL` form with an `SNVN` chunk. An SNVN program record is a big-endian u32 code length, u32 control length, a byte, u32 stream length, then a zlib stream that inflates to the program's code areas back to back followed by their control sections in the same order (0x840 bytes each on SDK 4). The chunk's tables differ between files, so the reader finds the records by their own lengths: a stream whose header ends where it says and that inflates to exactly code + control bytes.
+- **Startup archive in `main`:** the first programs the game builds (the `CGraphicsUtilCache` quads that draw the title logo) come from a startup material archive compressed into `main` (`NMaterialStartup::get_startup_archive_compressed_buffer`, 5,870 bytes; `NMaterialArchive::ImportStartupArchive` inflates it at boot). Its `CBufferedCompression` header is a type byte (1: LZSS on 8-bit units, `CLZSSDecompressor::DecompressBuffer8`) and three zero bytes; the data inflates to an `MTRL` form like `MaterialArchive.arc`'s. Its programs share code areas with `MaterialArchive.arc`'s but differ in control +0x7d0 (a per-program value), so their keys are their own.
+- **Reader:** `rfrm_shaders`, `snvn_records`, `retro_main_forms` and `retro_lzss8` in `shader_split.py`; each record is one program, so its stages pair with each other.
+- **Found on:** [Donkey Kong Country: Tropical Freeze](../../dm/games/0100C1F0051B6000/README.md) (SDK 4.4.0): 24,098 shaders (11,644 vertex, 11,734 pixel, 720 geometry, which run as compute kernels): 3,460 first seen in `MaterialArchive.arc` (its 3,468 stages), the rest in the 795 `MTRL` resources of the packs, 8 in the startup archive and 294 GLSLC outputs in `main`; about 8 s.
+
 ### MGFX effects in MonoGame XNB files
 
 - **How it is stored:** the 13 XNB files in `Content/Effects` (XNB platform `S`, uncompressed, read by `EffectReader`) each hold one MGFX effect, and `main` holds SpriteBatch's built-in one; no other file and no GLSLC output. A compressed XNB (MonoGame's LZX flag 0x80 or LZ4 flag 0x40, as in Stardew Valley) is decompressed first (`xnb_decompress`).
@@ -213,6 +228,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Monster Train 2](../../dm/games/010051701FB46000/README.md) (Unity 2022.3.54f1).
 - **Older layouts:** Unity 2019.4 stores each kernel's code directly, without `uniqueVariants` or `variantMap`. `unity_compute` accepts that form too, and `COMPUTE_2019_4` supplies the stripped-file layout. Found on [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) (2019.4.27f1); its missing runtime shader is the built-in GPU skinning kernel. The layout matches the release dump's 116 nodes and alignment flags, and both built-in compute objects decode to their exact ends.
 - **Note:** a file whose `ComputeShader` has no tree still goes to the second pass; if it has none there either, the split prints a `[RED]` line and leaves its kernels out instead of stopping, so profiles whose compute shaders were never read keep their tables: [Cuphead](../../dm/games/0100A5C00D162000/README.md) (2) and [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md) (4) have `ComputeShader` objects only in files without type trees, of hashes no layout covers. So does [Raging Loop](../../dm/games/010020400E1C2000/README.md) (Unity 2018.3: the two built-ins in `unity default resources`, whose 2018 layout lists kernels with no unique variants), which dispatches no compute.
+
+### GLSLC outputs in a Unity TextAsset
+
+- **Symptom:** black, jagged holes in the ground of a map (whole tiles of the terrain mesh missing while others draw), with about 25 distinct `[RED] shader … is not in the shader map` keys and `program has no vertex shader`, on a Unity game whose `Shader` objects all split cleanly.
+- **Cause:** the game draws its maps and effects with programs of its own, not Unity's: `DM_NVN_SHDUMP` saved 24 of them, and none was in any `Shader` subprogram of the 1,606 `Shader` objects in the RomFS (all of them decoded); their code areas were in `Data/resources.assets`, uncompressed, inside the `TextAsset` (class 49) `shader.switch.vfxsb` (11 MB, first word 0x20160817): 1,160 whole GLSLC outputs of a vertex and a pixel stage each. Their control sections carry GLSLC's full header (control +0x20 = 0xa10 and more), unlike the 0x850-byte sections Unity 2018 stores in its subprograms. The split read only `Shader` and `ComputeShader` objects, and the fallback for loose GLSLC outputs skips Unity files.
+- **Fix:** `unity_text_glslc` in `shader_split.py` reads the `TextAsset`s of a serialized file that holds the GLSLC magic (`unityfs.text_assets`: name and bytes, the two leading fields every Unity version shares, so no type tree is needed) through `glslc_shaders`, which keeps only outputs that pass its checks. A file without the magic is not decoded, so other games' tables do not change. This one TextAsset added 1,207 distinct shaders (the game has 31,635 in all), with 1,156 vertex / pixel pairs; they covered all 57 keys the runs had reported missing.
+- **Found on:** FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition (0100CE4010AAC000, Unity 2018.4.2f1; provisional profile, no note yet): the intro's overworld shot.
 
 ### Unreal Engine 5 shader code archives (Oodle)
 
@@ -569,6 +591,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** the vendored translator now follows the phis that feed a phi, and treats two `constant buffer | constant` handles as the same value ([third_party/ryujinx/README.md](../../dm/third_party/ryujinx/README.md)). Those accesses become ordinary type-3 handles.
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (218 pixel shaders).
 
+### Bindless reads whose handle phi also carries other values
+
+- **Symptom:** none in the log: texture reads come back 0. Particle meshes collapse to a point (their scale reads 0), so effects are missing or show as dark patches. The translator's own message (`Failed to find handle source for bindless access of type "textureBuffer"`) used to be dropped, because `dmsh_xlate`'s accessor had no `Log`; its messages now go into the shader's notes, marked `translator: `, and the build summary counts them apart from unanswered queries.
+- **Cause:** the handle reaches the read through a phi. Some inputs are c2 handle words, the others are not handles: undefined, or a value the compiler kept in the same register on a path where the predicated read does not run (float arithmetic, a texture result, the absolute value of a uniform word). Some phis merge two or more different c2 handles too (a float and a half-precision buffer). `TryConvertBindless` cannot trace one handle, and `GenerateBindlessAccess` refuses a phi with such an input, so bindless elimination deleted the read and wrote 0 to its results.
+- **Fix:** only for a phi `GenerateBindlessAccess` refuses (`TryTableHandle` in the vendored `BindlessElimination.cs`, marked `nxnative:`), the read takes the c2 handles among the phi's inputs (a word, or a texture word ORed with a sampler word or a constant sampler). With one handle, it takes the phi's place. With several, one read is made per handle and the result is the read whose handle equals the phi's value at run time: the host fills c2 with the bound handles, or with slot indices for `tex_dyn_slots`. A candidate that other reads of the shader use as a texture of another shape is left out, so those reads are converted in a second sweep once every other read has registered its texture (`ResourceManager.GetTextureTypes`). An image store or atomic with several candidates is left alone, since one per candidate would write each of them. A phi made only of handle words keeps `GenerateBindlessAccess` (the dynamic arrays of [Texture slots picked at run time](#texture-slots-picked-at-run-time)), so no other shader changes: in FINAL FANTASY RESONANCE, the SPIR-V of the 69,449 other shaders is byte for byte what it was. A chain change.
+- **Found on:** [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md): 58,122 reads removed (57,861 of them texture-buffer reads, mostly in Unreal's Niagara particle vertex factories), of which 58,096 in 3,197 shaders are now resolved: 21,380 with one handle, the rest choosing among 2 to 5 at run time. 26 reads in 14 shaders, whose handle comes from no c2 word, are still removed. Reported in GitHub issue #168.
+
 ### Texture slots picked at run time
 
 - **Symptom:** the shaders' bindless arrays have no slot and used not to load; the translator falls back to a 32-entry array such as `array<texturecube<float>, 32> fp_tcube_cb0_40000000`.
@@ -621,6 +650,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md): 2,084 such shaders (Unreal's GPU particles); three ran in the first 100 seconds. [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md): in the 64 KB dummy buffer used before, its atomic max into a 480x270 r32ui 2D array (fragment shader `2bd5037003980716`, the scene after the story opening's first cutscene) ran about 1.4 MB past its end, writing into zero-copy pools over the game's heap and into unmapped addresses (GitHub issue #101).
 - **Note:** Metal shader validation (`MTL_SHADER_VALIDATION=1`) stops out-of-bounds accesses, so under it the scene played.
 
+### Buffer image reflection keeps its texture type
+
+- **Symptom:** `image atomics: unsupported or overflowing IMG extent` at the first dispatch, despite a valid four-byte counter buffer.
+- **Cause:** `nvn_refl.m` classified `texture_buffer<uint>` as the default 2D texture. The atomic admission check correctly rejected the actual Metal buffer texture against that 2D descriptor.
+- **Fix:** the shared reflection type decoder recognizes `texture_buffer` as `MTLTextureTypeTextureBuffer`; the matched IMG and IMGA retain their buffer-image shape. `t_refl.m` checks the actual reflection converter with a paired buffer image and atomic pointer.
+- **Found on:** [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md), compute shader `2d2093c1f1d3a7e0`, image slot 2 (one R32Uint texel).
+
 ### Bounded MSL 2.3 atomic emulation
 
 - **Symptom:** Metal shader validation reports invalid image-atomic stores even with an image-sized scratch buffer; without validation, GPU page faults can freeze rendering.
@@ -630,10 +666,9 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 Sizing the backing buffer does not make an out-of-range image coordinate safe.
 The offline translator now preserves the Maxwell surface instruction's bounds
-mode and explicitly discarded result. Its Metal-only lowering accepts `IGN`
-reductions and non-CAS atomics writing `RZ`; returning, predicate-returning,
-`TRAP`, and unknown modes fail translation rather than acquiring invented
-out-of-bounds semantics. This path supports non-indexed 32-bit buffer, 2D and
+mode and whether the result is discarded. Its Metal-only lowering accepts `IGN`
+reductions and non-CAS atomics, including returned old-texel values. Predicate-returning,
+CAS, `TRAP`, and unknown modes fail translation. This path supports non-indexed 32-bit buffer, 2D and
 2D-array images. Other translator callers do not enable it. Source 1D and
 1D-array instructions retain the existing one-row normalization to 2D `(x, 0)`
 and 2D-array `(x, 0, layer)`; buffer coordinates stay scalar, and buffer MSL is
@@ -646,6 +681,19 @@ being removed by bindless elimination. These checks apply only to the Metal
 atomic path; other translator backends retain their existing behavior.
 Indexed, 3D, multisample and other unsupported effective image shapes fail
 closed on this opt-in path; this is not a native-image-atomic implementation.
+
+Returning `IGN` atomics join the valid operation's old-texel result with zero
+from the invalid-coordinate branch using an SPIR-V phi. The pointer and memory
+update exist only in the valid branch. This implements image-atomic bounds
+semantics ([ARB_shader_image_load_store, issue 30](https://registry.khronos.org/OpenGL/extensions/ARB/ARB_shader_image_load_store.txt)):
+invalid coordinates leave memory unchanged and return zero. Found on
+[SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md), whose
+two buffer-image counter shaders were dispatched at boot but rejected because
+they consume their returned values. `test_image_atomic_bounds.py` keeps that
+value live through a second atomic, validates the SPIR-V dataflow and both Metal
+SDKs, and optionally executes the buffer fixtures on a Mac GPU
+(`DMSH_TEST_GPU=1`, `t_atomic_return.m`): valid coordinates return the old value,
+negative and edge coordinates return zero, and surrounding sentinels stay intact.
 
 The SPIR-V queries the bound image's dimensions and tests every original
 coordinate (including the layer) before forming the texel pointer or executing
@@ -712,6 +760,14 @@ shader on a GPU.
 - **Fix:** `arch_file_ok` checks the GPU Mach-O load commands and payload ranges, universal slice bounds and the serializer's bundled Metal library ranges before opening the archive. It does not validate the compiler's private payload. `pso_bundle_covers` requires at least one actual lookup and no misses. `pso_offline.py` hashes every consumed library's bytes into the cache key; when all eligible pairs need device specialization, it removes old archives and writes `rest_pairs.tsv` without invoking `metal-tt`.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game), during review of its offline archive path with synthetic libraries and pair lists; no new gameplay or iPhone run.
 - **Check:** `dm/tools/tests/test_pso_offline.py` changes vertex and fragment library bytes without changing entries or stamps, and exercises the all-constant plan. `t_pso_bundle` rejects bare headers, truncated archives, malformed load commands and out-of-range universal slices, accepts real offline and serialized archives, and rejects zero-probe coverage.
+
+### Metal's build folders left by pipeline archive flushes
+
+- **Symptom:** the user cache folder (`getconf DARWIN_USER_CACHE_DIR`, then `com.apple.gpuarchiver/`) fills with `gpuarchiver-*` folders of 0.3–5 MB each, one per pipeline archive flush, and they stay after the game exits: 456 folders, 2.5 GB, on one Mac after two days of NVN game runs. On iOS they stay in the app's own cache folder.
+- **Cause:** the Metal 4 serializer (`MTL4PipelineDataSetSerializer`) makes a build folder for the captures between two flushes: at the first compile it captures, or, for bases taken again from lookup archives (compaction), during the flush. No flush, release or exit removes the folder. Nothing reads it once its flush has written the archive file: a probe that removed each folder after its flush took every pipeline from the files again. The process keeps no file open in it, and on the Mac the folder is shared by all of the user's programs.
+- **Fix:** `nvn_mtl.m` (`ga_capture`, `ga_flushed`, `ga_exit`): the first capture after a flush lists the folder before and after its compile and takes the one folder that appeared as its own; the flush removes it once its file is written, together with the one folder the flush made when it held recaptures; exit removes the folder of captures no flush wrote. When more than one folder appeared in that window (another program's capture), none is removed. On iOS the start removes the folders earlier runs left. Folders left before this fix stay; they are safe to delete while no game or Metal tool runs.
+- **Found on:** reported by MacNativeGames (`1eff989`, `110e6c6`, Metal 3's `MTLBinaryArchive`, 25 GB overnight on Tears of the Kingdom); reproduced here with the Metal 4 serializer by a probe and on this repository's Mac, no single game identified.
+- **Check:** `t_pso_archive` checks that the first capture finds the folder and the flush removes it; a run of the test leaves no new folder (it left two before the fix, one from compaction and one from captures no flush wrote).
 
 ### Pipeline keys omit unused colour state
 
