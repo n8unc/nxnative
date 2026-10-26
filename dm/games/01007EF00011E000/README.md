@@ -15,7 +15,7 @@ Update 1.9.0 (v1114112) over the base game, SDK 20.5.22. Nintendo EPD's engine (
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | no system resource in the NPDM: the game uses `SetHeapSize`. 13 Sentinels' partition (256 MB in front + 256 MB alias + 256 MB stack + 3.25 GB heap) |
 | Node area cut 1 GB → 62 MB | `dm/tools/sdk_patches.py`, `sdk` build `574284b4…` | registered for Tears of the Kingdom's issue #70 on the same `sdk` build, so it applies here too |
 
-No `alpha_from_red` (no longer needed since the `nvnTextureCompare` fix), no `tex_flush_upload` (a minute's boot saw it flush 32 CPU-filled textures with data, and it needs none), no `feedback_snap`.
+No `tex_flush_upload` (a minute's boot saw it flush 32 CPU-filled textures with data, and it needs none), no `feedback_snap`.
 
 ## Frame rate
 
@@ -72,10 +72,25 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 - **Cube textures sampled as cube arrays**: 1,512 shaders sample the environment probes as `texturecube_array` with a single cube bound; NVN cube textures are now 6-layer 2D arrays bound through views (`tex_fit`).
 - **Resolved: a compressed texture as a render target (GitHub issue #4, iPhone 14 Pro).** agl's BC4 block encoder (`8e2cc2671cae6020`) writes a 32×32 RGTC1 (BC4) texture through an `RGBA16UI` view (one texel per 8-byte block). Metal can neither attach a compressed format nor view one uncompressed, and pipeline validation aborted, so the draws did nothing. The pass now draws into an uncompressed shadow of blocks × blocks (`bcrt_attach` / `bcrt_flush`, from PR #11); its output is declared `uint` in `shader_facts_manual.tsv`, as is its 2D-source twin `93aa5e22a8202409`, whose failure showed up in an iPhone run. The A16 has no BC formats; the old decompression path (about 3.9 GB instead of 2.8 GB for this game, over iOS's limit on a 6 GB iPhone) has been removed.
 - **Resolved: the sky brownish grey, the distant haze brown (GitHub issue #52, Mac and iPhone).** Each frame a pass (`08fe25061d583637`, `uking_pass_shader.sharcb`) turns a 256×32×16 RGBA16F 3D table of in-scattered light into a 256×256 sky map, which the sky draw (`8110c74078548172`) and the materials' aerial perspective sample. The table and two 2D ones (transmittance 256×64, irradiance 64×64) come from `System/KSys/sky.skybin` in `Pack/Bootup_Graphics.pack` (1,212,416 bytes). The game makes a `CPU_CACHED | GPU_CACHED` pool per texture, creates the textures, copies the data in with `memcpy` and flushes (`main+0x1257d50`, once; the flush goes through `main+0xebf4c4`). The host made the 3D table a GPU texture of zeros. `DM_NVN_TEXRAW=212,214` and `DM_NVN_TEXINFO=256x32` (`storage 1048576 bytes non-zero 781567`, `swizzled=0`) showed it. Every game now fills a texture from storage the game flushed before its first use (`nvn_flushed`, `tex_init_fill`; `DM_NVN_FLUSH_FILL=0` turns it off). In the Great Plateau save it fills that one texture; the flushes (about 15 a frame) merge into about 530 ranges, frame times unchanged.
-- **Resolved: dark boxes and cream cloud rectangles behind HUD prompts, a black stamina wheel and a black System menu background (layout captures, GitHub PR #6).** Panes tagged `CaptureOn` (about 140 layouts, e.g. `PaGuideKeySmoke_00`; user data `A8`, `CaptureScale` 0.5, `MultiFilter`) are drawn, blurred at half size and copied into a capture texture that replaces the placeholder `FBLayout_00`. The game creates it with its per-format default mapping (`main+0xecb0bc`: R8 → (R, 0, 0, 1), RG8 → (R, G, 0, 1), …), then rebuilds it on the same storage with the capture's mapping: `main+0xf597dc` picks (1, 1, 1, R) for an `A8` capture and alpha 1 when the pane says `CaptureOutputAlpha` 255 (read at `main+0xf58e98`); `main+0xecacf0` stores the mapping and rebuilds (`main+0xecabe8`), and `main+0xec33f0` replaces the registered descriptor only if `nvnTextureCompare` reports a difference. The host ignored the mapping, so the captures kept (R, 0, 0, 1): hard-edged dark boxes (the shadow pane `e6a88e12dbae9743`) and cream cloud (the glow `aa209f57b133e862`). The earlier `alpha_from_red` workaround (all 26 layout pixel shaders, `main`'s BNSH at 0x1d83000, `tex_alpha_red`) fixed the alpha but zeroed green and blue (a black stamina wheel) and left the System menu black. `nvnTextureCompare` now compares the mapping (an unset mapping counting as (R, G, B, A)); checked on the Mac by the PR's author: green stamina, the purple noise meter, the blurred System menu.
+- **Resolved: dark boxes and cream cloud rectangles behind HUD prompts, a black stamina wheel and a black System menu background (layout captures, GitHub PR #6).** Panes tagged `CaptureOn` (about 140 layouts, e.g. `PaGuideKeySmoke_00`; user data `A8`, `CaptureScale` 0.5, `MultiFilter`) are drawn, blurred at half size and copied into a capture texture that replaces the placeholder `FBLayout_00`. The game creates it with its per-format default mapping (`main+0xecb0bc`: R8 → (R, 0, 0, 1), RG8 → (R, G, 0, 1), …), then rebuilds it on the same storage with the capture's mapping: `main+0xf597dc` picks (1, 1, 1, R) for an `A8` capture and alpha 1 when the pane says `CaptureOutputAlpha` 255 (read at `main+0xf58e98`); `main+0xecacf0` stores the mapping and rebuilds (`main+0xecabe8`), and `main+0xec33f0` replaces the registered descriptor only if `nvnTextureCompare` reports a difference. The host ignored the mapping, so the captures kept (R, 0, 0, 1): hard-edged dark boxes (the shadow pane `e6a88e12dbae9743`) and cream cloud (the glow `aa209f57b133e862`). The earlier `alpha_from_red` workaround (all 26 layout pixel shaders, `main`'s BNSH at 0x1d83000; since removed from the host) fixed the alpha but zeroed green and blue (a black stamina wheel) and left the System menu black. `nvnTextureCompare` now compares the mapping (an unset mapping counting as (R, G, B, A)); checked on the Mac by the PR's author: green stamina, the purple noise meter, the blurred System menu.
 - The game keeps NVN's GL depth mode. It has an `RG8_UI2F` vertex attribute (converted on the CPU, `vconv_i2f`). 101 compute and 4 vertex shaders read the driver segment `c0`; they render the same since compute `c0` carries the dispatch size.
 - It finalizes its transient render targets before every submit and builds them again the next frame, which the storage-takeover rule guards with a 16-submission window (`alias_take_over`).
 - Windowed on the Mac with `present_now`'s residency commit: its title, 60 fps, no GPU error.
+
+### Upscaling (current)
+
+Handheld, the game draws 1280x720 into its 1920x1080 window textures and crops the window to it. Docked it scales its 900p scene to 1080p with one draw and draws the HUD on the 1080p target. The optional [MetalFX present](../../../docs/reference/rendering.md#the-present-upscales-through-metalfx) scales that presented picture in either mode; it cannot recover detail lost in the game's own upscale.
+
+Measurements reported in [PR #215](https://github.com/seedds/nxnative/pull/215), the present command buffer's GPU time:
+
+| Device and content → output | MetalFX | Standard |
+|---|---|---|
+| M2 Max, handheld 1280x720 → 2560x1440, full screen | 0.74–1.32 ms | 0.07–0.11 ms |
+| M2 Max, docked 1920x1080 → 2560x1440, full screen | 1.35 ms | 0.11 ms |
+| M2 Max, 1280x720 → 2868x1320, offscreen | 0.40–1.17 ms | 0.04–0.07 ms |
+| iPhone 17 Pro Max, docked 1920x1080 → 2346x1320 | p50 2.1–5.0 ms per 600 presents; p95 up to 6.1 ms | Not measured on that build |
+
+On the Mac, frame times stayed at 60 fps; crop comparisons showed sharper edges on Link, his shield and the map text, with unchanged colours. The iPhone ran at 60 fps with the launcher setting reaching the host; a cold docked run reached thermal state serious after 226 s, a warm start after 64 s. The matching iPhone Standard run and MetalFX's share of the thermal cost remain unmeasured. Standard stays the default. These gameplay measurements are the PR author's; this integration has not repeated a device gameplay run.
 
 ## Memory
 
@@ -102,6 +117,34 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 - **Resolved: duplicate pipeline keys from disabled blend state.** A recording held 4,829 keys for 1,982 distinct pipelines from 1,818 Metal 4 bases; 2,845 keys differed only in blend factors of targets whose blending was disabled. [Pipeline keys omit unused colour state](../../../docs/reference/shaders.md#pipeline-keys-omit-unused-colour-state) describes the shared normalization.
 - `pack_ipa.py` packs its 16 GB IPA in 57 s (Info-ZIP took 2 min 50 s).
 
+### Pipelines on a cold start
+
+- `pso_pairs.tsv`: 3,012 shader pairs from agl's BAHS program variations (the agl / gsys / terrain resource packs), which `shader_pairs.tsv` does not hold. 109 of the 543 pairs drawn on entering Zora's Domain came from them; with the table all 543 are known. The prebuild (15,767 bases) takes 910 MB in 16 files, 187 s with 7 workers for the first 12,755 and 19 s for the 3,012 more; the files open in 2.2 s cold, 0.25 s from the file cache, and add about 850 MB of footprint.
+- Mac (M2 Max), the Zora's Domain save, Metal shader cache empty (a new bundle ID per run):
+
+| Start | Frame entering the area | Draws that waited, entering it |
+|---|---|---|
+| `DM_PSO_MTL4=0`, no `pso_user.tsv` | 990 ms, then 535 / 738 / 496 ms frames | 512 draws, 3,325 ms |
+| Hybrid, archive prebuilt from `shader_pairs.tsv`, no `pso_user.tsv` | 830 ms, no other frame over 250 ms | 102 draws, 650 ms |
+| Hybrid, archive prebuilt with `pso_pairs.tsv` too, no `pso_user.tsv` | 340 ms, no other frame over 150 ms | 50 draws, 20 ms (no pair without its pulling base) |
+| Hybrid, archive and `pso_user.tsv` of an earlier run | no frame over 100 ms | 17 draws, 4.6 ms |
+
+Every kind of cold start also shows the game's own 130–220 ms frames every 9–13 frames for a while after the load, with no pipeline work in them.
+
+- The prepare step with the seed list `pso_manifest.tsv` (1,789 lines: New Game to the Shrine of Resurrection, then a Zora's Domain save load). Mac (M2 Max), runs started at a 1-minute load average below 4: Metal cache empty (a new bundle ID per run), the prebuilt archive, that save loaded. Frames over 25 ms with new pipelines or shader library loads, in the 60 s after the last menu press:
+
+| Start | Before the first frame | Frames with pipelines / library loads |
+|---|---|---|
+| No list (the profile before its list) | – | 4 / 5 (75 libraries), 168 ms of that work, worst frame 128 ms |
+| The list, background prewarm (`DM_PSO_PREPARE=0`) | – (14.6 and 16.0 s on one worker, during boot) | 0 / 0 (two runs) |
+| The list, prepare step | 5.2 and 2.2 s on 12 workers, 3.3 s on 8 (872 bases compiled) | 0 / 0 (three runs) |
+| Second start (Metal cache and archive warm) | 0.08 s, no screen | 0 / 0 |
+| A player's list (5,783 lines with the manifest), warm | 0.23 s, no screen (2.7 s in the background) | 0 / 0 |
+
+- **The pipeline archive made offline** ([development.md](../../../docs/development.md#the-pipeline-archive-made-offline)): every one of the 15,767 pairs makes a base (none left to the device, none left out); `metal-tt` built the iPhone 17 Pro Max's archive (`applegpu_g18p`, iOS 27.0) in 252 s on an M2 Max: 653 MB, 219 MB zipped. On that iPhone (iOS 27.0.1) a test app found all 200 bases of a 200-pair archive, at 0.06–0.3 ms each. On the Mac the same build for the M2 Max (`applegpu_g14s`, 615 MB, 253 s) held all 15,767 bases: the prebuild tool with it opened it in 1.8 s from the external drive, found 16 of 16 probed bases in 57 ms and built nothing, where the device's own prebuild took 187 + 19 s on 7 workers. The process's footprint rose by about 615 MB with the archive open. Resolved on the iPhone 17 Pro Max (iOS 27.0.1): the app with the archive (622.8 MB) opened it in 555 ms, found 16 of 16 probed bases in 17 ms, and its prepare step took 0.53 s with no base compiled (1,722 bases from the archives), where the device's own prebuild took 7–8 minutes on a first start; footprint 1,424 MiB at frame 300 and 2,579–2,679 MiB in play to frame 2,100, with the device's own earlier prebuild (932.7 MB in 30 files of `pso_archive/`, from before the archive was shipped) still open beside it.
+
+On this Mac the background prewarm also ends before the save loads, so the step changes the first minute only where the prewarm is slower than the way into play: a slower device, fewer cores, a longer list, a player who skips through the title. Frames over 25 ms without pipeline work (20–71 per run) are the game's own and vary with the machine's other load.
+
 ## Mac routes
 
 - From the title menu into the autosave: `DM_KEYS=f2500:A,f2800:A,f3100:A,f3400:A` (control at frame ~3900).
@@ -111,6 +154,9 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 
 General host changes first needed here; each applies to every game:
 
+- **Resolved: the IPA omitted pulling libraries with `pso_mtl4 on`, and explicitly including them failed under macOS Bash 3.2.** See [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs).
+- **Upscaling in the present** (`fx_encode`, `DM_PRESENT_UPSCALE`): [The present upscales through MetalFX](../../../docs/reference/rendering.md#the-present-upscales-through-metalfx).
+- **Thermal cap; resolved movie recovery and acquire/present races** (`thermal_capped`, `DM_THERMAL_CAP`): [A thermally serious iPhone holds 30 fps](../../../docs/reference/frame-rate.md#a-thermally-serious-iphone-holds-30-fps).
 - **Pipeline keys omit disabled blend factors** (`pso_key_norm`): [Pipeline keys omit unused colour state](../../../docs/reference/shaders.md#pipeline-keys-omit-unused-colour-state).
 - **Resolved: GPU readback temporaries retained by a game thread's outer pool** (`mtl_read_texels`): [GPU readback without an autorelease pool](../../../docs/reference/memory.md#gpu-readback-without-an-autorelease-pool). Ported from MacNativeGames; checked here with a synthetic Metal readback lifetime test, without a new gameplay memory measurement.
 - **The host frame step in whole vsyncs** (`nvn_fstep.h`, `fstep_tick`, `FRAME_STEP` stubs, `fps_target`), explained in full under [Frame rate](#the-frame-step-current); its probes (`nvn_fstep_gpu_slowed`, `nvn_fstep_same`): [development.md, Power](../../../docs/development.md#power).
@@ -119,9 +165,16 @@ General host changes first needed here; each applies to every game:
 - **Spin waits that take a spin lock** (`patch_nso.py` "Spin waits", `dm_spin_wait`) and **yields that make progress** (`thr_yield`): [development.md, Power](../../../docs/development.md#power).
 - **`DT_RELR`** (`relr_apply`) and **halfword jump tables** (`half_count`): [Packed relative relocations (DT_RELR)](../../../docs/reference/rewriter.md#packed-relative-relocations-dt_relr), [Halfword jump table landing pads sized to the largest entry](../../../docs/reference/rewriter.md#halfword-jump-table-landing-pads-sized-to-the-largest-entry). **NVN calls on the big host stack** (`nvn_big_entry`): [NVN entry points on the big host stack](../../../docs/reference/nvn-objects.md#nvn-entry-points-on-the-big-host-stack).
 - **SDK 20 service calls** and **record sizes against `GetCommandMemoryUsed`** (`draw_rec`): [SDK 20 six-axis sensor and amiibo (`nfp`) calls](../../../docs/reference/services.md#sdk-20-six-axis-sensor-and-amiibo-nfp-calls), [Applet resource user ID, launch parameters and VR mode](../../../docs/reference/services.md#applet-resource-user-id-launch-parameters-and-vr-mode), [Shared font load request](../../../docs/reference/services.md#shared-font-load-request), [Model heaps sized by the host's command record sizes](../../../docs/reference/memory.md#model-heaps-sized-by-the-hosts-command-record-sizes). **SDK 20's audio renderer layout** (`render_once`): [SDK 20's `AudioRenderSystem` layout](../../../docs/reference/audio.md#sdk-20s-audiorendersystem-layout). **Running a 30 fps game at 60**: [sead's dynamic present interval, `ksys::VFR` and the host's frame step](../../../docs/reference/frame-rate.md#seads-dynamic-present-interval-ksysvfr-and-the-hosts-frame-step).
+- **Pipeline bases, hybrid pipelines, the prebuild and the prepare step** (`pso_build_ex`, `hybrid_get`, `pso_prebuild`, `warm_prepare`): [development.md, Hybrid pipelines](../../../docs/development.md#hybrid-pipelines), [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs), [the prepare step](../../../docs/development.md#the-prepare-step); measured under [Pipelines on a cold start](#pipelines-on-a-cold-start).
+- **The pipeline archive made offline** (`dm/gfx/tools/pso_offline.py`, `pso_bundle_open`, `pso_bundle_covers`): [development.md, The pipeline archive made offline](../../../docs/development.md#the-pipeline-archive-made-offline); measured under [Pipelines on a cold start](#pipelines-on-a-cold-start).
+- **Resolved in synthetic archive review checks:** truncated archive containers, zero-probe coverage, stale archives after library bytes change, and plans whose pairs all require device specialization: [Offline pipeline archive reuse and fallback](../../../docs/reference/shaders.md#offline-pipeline-archive-reuse-and-fallback). Checked with generated libraries on the Mac; no new gameplay or iPhone validation.
+- **GPU measurement on the iPhone** (`DM_NVN_GPUPROF=every:n`, `DM_AB`, `DM_GPU_CAPTURE`, `dm/tools/gpuprof.py`) and **captures with pipelines built through the device** (`pso4_on`): [05, GPU time on the device](../../../docs/agents/05-debugging.md#gpu-time-on-the-device), [GPU frame captures need pipelines built through the device](../../../docs/reference/shaders.md#gpu-frame-captures-need-pipelines-built-through-the-device).
+- **Resolved in synthetic profiling review checks:** [Periodic GPU profiles close at frame boundaries](../../../docs/reference/rendering.md#periodic-gpu-profiles-close-at-frame-boundaries). No new gameplay or iPhone validation.
 - **Hitch dumps and guest thread names** (`DM_HITCH_DUMP`), **heap probes** (`DM_PROBE_HEAP*`), **autorelease leaks**: [05, Scripted input and thread scheduling](../../../docs/agents/05-debugging.md#scripted-input-and-thread-scheduling), [05, Memory growth](../../../docs/agents/05-debugging.md#memory-growth).
 
 ## Open
+
+- The shipped pipeline archive without the device's own earlier prebuild files (the test iPhone's `pso_archive/` still held them, [Pipelines on a cold start](#pipelines-on-a-cold-start)): the footprint against the app's memory limit and the frame times after it.
 
 - The GPU particles' compute dispatches and the G-buffer decals still split passes; about 800 MB of attachments a frame outdoors.
 - `DM_RENDER_SCALE` does not change the Mac's GPU time; the sources give no iPhone measurement.
