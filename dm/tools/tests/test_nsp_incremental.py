@@ -338,6 +338,15 @@ class SplitShaders(Base):
         self.assertEqual(self.splits, 2)
         self.go(g); self.assertEqual(self.splits, 3)   # a damaged run leaves no key behind
 
+    def test_missing_split_pairs_are_generated_again(self):
+        for n in self.NAMES[:3]: (self.src / n).write_text(self.table(n))
+        g = game.Game(self.src)
+        self.go(g, own=False)
+        pairs = self.pkg.with_name('pso_pairs.tsv'); pairs.unlink()
+        self.go(g, own=False)
+        self.assertEqual(self.splits, 2)
+        self.assertEqual(pairs.read_text(), self.table('pso_pairs.tsv'))
+
     def test_derived_rerun_is_incremental(self):   # the whole derived path of a second run: derive, prepare, rewrite keys, split
         g = self.own(); g = nsp.set_keys(g, {'mem_used': ('0x4800000', '')}, 'After the rewrite'); k = self.go(g)
         g = self.own(); self.assertEqual(g.get('mem_used'), '0x4800000')

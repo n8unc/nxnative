@@ -71,6 +71,26 @@ Generated projects and Xcode build products stay in that folder; the host profil
 header is generated under `dm/host/gen/` as usual. CI uploads failure logs.
 GPU regression tests still run locally with `make -C dm/gfx/tests GAME=<id> run`.
 
+`.github/workflows/lint-python.yml` lints `scripts/` and the Python tools under
+`dm/` with ruff (rules for bugs, never reformatting) and type-checks them with
+pyright in basic mode (`pyproject.toml`). It is a ratchet: today's findings are
+in `dm/tools/lint_python_baseline.tsv`, so it fails only on a new finding, or on
+a fixed one still listed there. Astral's ty, a faster type checker, can replace
+pyright once it is stable. With the pinned tools in a new venv:
+
+```sh
+python3 -m venv /path/to/lint-venv && /path/to/lint-venv/bin/pip install -r .github/requirements/lint.txt
+/path/to/lint-venv/bin/python3 dm/tools/lint_python.py            # the check CI runs
+/path/to/lint-venv/bin/python3 dm/tools/lint_python.py --update   # after fixing findings: shrink the baseline
+```
+
+The baseline never gains entries: fix a new finding, or silence it on its line
+(`# noqa: <rule>`, `# pyright: ignore[<rule>]`) with a reason. Only a raised tool
+version in `.github/requirements/lint.txt` rewrites it (`--rebaseline`). On pull
+requests, only the checker whose pinned release version increased may gain
+baseline entries or counts. Comments, dependency updates and checker downgrades
+do not allow growth.
+
 ## The packing script in detail
 
 `scripts/build_ipa_from_nsp.py` (`-h` lists every option):
@@ -277,7 +297,7 @@ The unsigned IPA build still uses the repository's `dm/ios/DmIOS.xcodeproj`, ski
 
 Each game has a profile in `dm/games/<id>/`:
 - `game.tsv` holds the title ID, known builds, code modules, RomFS marker, memory split, app name and bundle ID;
-- the shader tables: `shader_map.tsv`, `shader_facts.tsv`, `shader_pairs.tsv`, `pso_pairs.tsv` (pairs only the pipeline prebuild reads), `pso_manifest.tsv`, and `c1_full.tsv` / `cb_extent.tsv`, which each checkout's full shader build makes (not committed);
+- the shader tables: `shader_map.tsv`, `shader_facts.tsv`, `shader_pairs.tsv`, `pso_pairs.tsv` (pairs used by vertex output padding and the pipeline prebuild), `pso_manifest.tsv`, and `c1_full.tsv` / `cb_extent.tsv`, which each checkout's full shader build makes (not committed);
 - `patches.py` (when there are any): the rewriter's patches of the game's own builds.
 
 The shader translation chain has one version for every game, in `dm/gfx/nvn/dmsh_chain.h`.
@@ -396,7 +416,7 @@ flowchart TD
 
 Every 300 frames the log has a `pipelines up to frame` line. It gives the submit thread's pipeline, library and prediction time; archive lookups that found the base or none; specializations and base compiles on all threads; draws with a hybrid pipeline; background builds; and the draws that waited, by why no stand-in served them. `DM_PSO_WAITLOG=1` logs every wait over 20 ms with its shader pair. `DM_PSO_PULL_ALL=1` (diagnostic) draws every draw that has a pulling pipeline with it. In steady state the GPU time is the same with and without the hybrid: in Breath of the Wild, mean GPU p50 over frames 2,400–5,100 was 8.98 ms with it, 8.98 ms on the Metal 4 path without it, and 9.35 ms through the `MTLDevice`.
 
-The **prebuild** puts the pulling base of every known shader pair into the archive (`pso_prebuild`), so a cold start's draws have stand-ins. The pairs come from the profile's `shader_pairs.tsv` and `pso_pairs.tsv`. `shader_pairs.tsv` pairs the stages of one BNSH variation (and the other readers' programs). It held none of the pairs from agl's BAHS shader archives (`.sharcb`, the agl / gsys / terrain resource packs), and in Breath of the Wild 109 of the 543 pairs drawn on entering Zora's Domain came from those. `shader_split.py` now reads the binary and program arrays of a BAHS file (`bahs_variations`) and pairs the n-th vertex binary of a program with its n-th fragment binary. Those pairs go to `pso_pairs.tsv`, which only the prebuild reads. `vs_pad` keeps reading `shader_pairs.tsv`, so the shader libraries, the inputs digest and the other profiles' tables are unchanged. For Breath of the Wild that is 3,012 more pairs, and all 543 pairs drawn are now known. A profile made before the table existed still packs: the NSP script then keeps the table beside the shader package and hands it to the prebuild (`DM_PSO_PAIRS`). Super Mario Odyssey, Mario Bros. Wonder, Mario Kart 8 Deluxe, 3D World, Animal Crossing, Captain Toad and Tears of the Kingdom have BAHS files too; their tables are made at their next pack.
+The **prebuild** puts the pulling base of every known shader pair into the archive (`pso_prebuild`), so a cold start's draws have stand-ins. The pairs come from the profile's `shader_pairs.tsv` and `pso_pairs.tsv`. `shader_pairs.tsv` pairs the stages of one BNSH variation (and the other readers' programs). It held none of the pairs from agl's BAHS shader archives (`.sharcb`, the agl / gsys / terrain resource packs), and in Breath of the Wild 109 of the 543 pairs drawn on entering Zora's Domain came from those. `shader_split.py` now reads the binary and program arrays of a BAHS file (`bahs_variations`) and pairs the n-th vertex binary of a program with its n-th fragment binary. Those pairs go to `pso_pairs.tsv`. The shader build reads both tables to pad every vertex output its pixel partners need ([reference](reference/shaders.md#pixel-shader-inputs-the-vertex-shader-does-not-write)); the pairs also control build order and cache dependencies. The profile's `pso_pairs.tsv` is part of its inputs digest. For Breath of the Wild that is 3,012 more pairs, and all 543 pairs drawn are now known. A profile made before the table existed still packs: the NSP script then keeps the table beside the shader package, where the shader build reads it, and hands it to the prebuild (`DM_PSO_PAIRS`). Super Mario Odyssey, Mario Bros. Wonder, Mario Kart 8 Deluxe, 3D World, Animal Crossing, Captain Toad and Tears of the Kingdom have BAHS files too; their tables are made at their next pack.
 
 With the prepare step (a window, the iPhone) the prebuild runs right after it when the bases are not there yet, before the game's first frame, behind the same progress screen ("Preparing pipelines"), on every core, flushing every 1,000 bases; a first start waits for it once. Built in the background while playing instead, they took an iPhone 17 Pro Max's GPU from about 13 to 15–18 ms a frame in Breath of the Wild, through the compiler's load on the shared power budget. Without a prepare step it still runs in the background after the prewarm, on a utility queue on half the performance cores (`DM_PSO_PREBUILD=0` turns it off either way). On the Mac it also runs as a tool, `DM_PSO_PREBUILD=tool`: build, write, exit. The NSP script runs the tool in a `--platform mac` build, into `<id>_build/run/pso_archive` (log `pso_prebuild.log`): this is how the Mac gets its archive. It runs once per chain version, depth mode and pair list (`pso_archive/prebuilt.tsv`: the pair lists' size and SHA-256). `DM_PSO_PREBUILD_DEPTH=zero` serves a game that sets the near=0 depth mode (the NSP script sets it from the profile key `depth_mode`); `DM_PSO_PREBUILD_THREADS=<n>` sets the workers. Its files hold bases without a vertex layout only, and are named `pNNNNN.mtl4a`; a base with a vertex layout is never looked up in them, and compaction leaves them alone. Breath of the Wild on an M2 Max: 15,767 bases, 910 MB in 16 files, 187 s with 7 workers for the first 12,755 and 19 s for the 3,012 more. Opening the files took 2.2 s on the first start (0.25 s from the file cache). The host's footprint is about 850 MB larger with them open (2,067 against 1,215 MiB at the title), which is one reason the Metal 4 path stays off on iOS unless a game's profile was tested with it (`pso_mtl4`). On iOS the standard is the archive made on the Mac and shipped in the app (next section); the device's own prebuild is the fallback, for an app without a usable archive.
 
@@ -453,6 +473,7 @@ Each game's notes are in its profile folder, `dm/games/<id>/README.md`: what the
 | `nx_extract/` | NSP → ExeFS / RomFS / icon with LibHac, merging an update over the base game (C#, `dotnet build`). `--manifest` writes ExeFS and a RomFS file list only, for surveys |
 | `nso_fnmap.py` | Carries offsets from one build to another (function matching with addresses masked; globals via their references) |
 | `nso2elf.py` | Converts NSO to ELF for Ghidra / REA |
+| `env_switches.py` | Writes [docs/env_switches.tsv](env_switches.tsv): every `DM_*` environment switch the code reads, with its class and a one-line meaning. The classes: player (a launcher setting, `dm/games/settings.tsv`), path (names a file or folder), switch (changes what the host or a tool does), diagnostic (logs, dumps, probes, measurements), test (read only by tests). It keeps the class and meaning of each row and adds a row for a new switch, whose meaning its author writes; `test_env_switches.py` fails until they do, and when a row names a switch nothing reads. It also lists the names the docs quote that nothing reads |
 | `gpuprof.py` | Sums the host's `[gpuprof]` lines (`DM_NVN_GPUPROF`) by pass shape or size class, lists one frame's encoders in GPU order, and gives the medians of the `[ab]` phases (`DM_AB`) |
 | `insn_census.py` | Counts the instruction sites the rewriter must handle |
 | `nso_code.py` | Function ranges from `.eh_frame` and the data blocks in a text segment, which the rewriter and the census leave out |

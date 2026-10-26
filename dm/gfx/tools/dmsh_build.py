@@ -518,6 +518,8 @@ def reflect(key, stage, msl, res):
             d = decode_tex(nm)
             if not d: e.update(kind='?')
             else: e.update(kind='img' if re.match(r'[a-z]+_i', nm) else ('tbuf' if 'texture_buffer' in ty else 'tex'), reg=d[0])
+            # native texture atomics (dmsh_atomic.py): Metal allows them only on an R32Uint / R32Sint texture made with the shader-atomic usage, which the host checks for this slot
+            if e.get('kind') == 'img' and re.search(r'\b%s\.atomic_' % re.escape(nm), msl): e['atomic'] = True
             # a 1D integer fetch the translator read as 2D rows of 16384 texels (Program.cs RecordTexelFetch1D): the host binds a texture buffer in this slot as such rows (nvn_mtl.m tbuf_as_2d)
             if e.get('kind') == 'tex' and e.get('reg') in res.get('fetch1d', ()):
                 e['fetch1d'] = True
@@ -595,10 +597,20 @@ def int_inputs(src):
         if not bad and nint: out[str(loc_)] = 'uint'
     return out
 
-# vertex / pixel pairs (taken from BNSH variations by shader_split.py): vertex key → paired pixel keys
-PAIRS = collections.defaultdict(set)
-for _ln in open(GAME.table('shader_pairs.tsv')):
-    if _ln.strip() and not _ln.startswith('#'): _v, _p = _ln.split(); PAIRS[_v].add(_p)
+# Both pair tables feed pipelines, so both must feed padding, build order and shader cache keys.
+def load_pairs(game, package):
+    pairs = collections.defaultdict(set)
+    for table in ('shader_pairs.tsv', 'pso_pairs.tsv'):
+        path = str(game.table(table))
+        if table == 'pso_pairs.tsv' and not os.path.isfile(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(package)), table)   # the split's copy for profiles predating this table
+        if table == 'pso_pairs.tsv' and not os.path.isfile(path): continue
+        with open(path) as f:
+            for ln in f:
+                if ln.strip() and not ln.startswith('#'): v, p = ln.split(); pairs[v].add(p)
+    return pairs
+
+PAIRS = load_pairs(GAME, dm_dir)
 
 def vs_pad(key, src):
     """Give a vertex shader the outputs its paired pixel shaders read but it does not write, with the value (0,0,0,1).
@@ -608,7 +620,8 @@ def vs_pad(key, src):
     want = set()
     for ps in PAIRS.get(key, ()):
         fn = os.path.join(out, ps + '_b.metal')
-        if os.path.exists(fn): want |= {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', open(fn).read())}
+        if os.path.exists(fn):
+            with open(fn) as f: want |= {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', f.read())}
     miss = sorted(want - {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', src)})
     i = src.find('struct main0_out\n{\n'); j = src.find('\n};', i); k = src.find('main0_out out = {};')
     if not miss or i < 0 or j < 0 or k < 0: return src, []
@@ -798,9 +811,9 @@ def geometry_finish(key, w, j, c1):
         layout = dmsh_geometry.output_layout(code, t)
         k = job['key']; spv = os.path.join(w, k + '.spv')
         dmsh_geometry.flatten_sets(spv)
-        r = subprocess.run(['spirv-cross', *XC, spv], capture_output=True, text=True)
+        r = subprocess.run(['spirv-cross', *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
-        src = dmsh_geometry.capture_input(dmsh_geometry.topology_pointer(precise(dmsh_atomic.lower_msl(r.stdout))))
+        src = dmsh_geometry.capture_input(dmsh_geometry.topology_pointer(precise(dmsh_atomic.check_msl(r.stdout))))
         res = json.load(open(os.path.join(w, k + '.res.json')))
         refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                 'source': f'{loc[key][0]}#{loc[key][1]}', 'pc_paired': pc_of[key], 'stage': 'gs',
@@ -820,9 +833,9 @@ def geometry_finish(key, w, j, c1):
             base = {**refl, 'key': key + '_b'}
             save('_b', src, base)
             spv = os.path.join(w, k + '.reader.spv'); dmsh_geometry.flatten_sets(spv)
-            r = subprocess.run(['spirv-cross', *XC, spv], capture_output=True, text=True)
+            r = subprocess.run(['spirv-cross', *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
             if r.returncode: return 'geometry reader failed', r.stderr.strip()[:160], None
-            reader = vs_layer(vs_init(dmsh_geometry.reader(precise(dmsh_atomic.lower_msl(r.stdout)))))
+            reader = vs_layer(vs_init(dmsh_geometry.reader(precise(dmsh_atomic.check_msl(r.stdout)))))
             analysis, full = vs_depth(reader)
             meta = {'key': key + '_bgv', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                     'stage': 'vs', 'entry': 'main0', 'entry_z': 'main0_z', 'msl_entry_kind': 'vertex',
@@ -845,7 +858,7 @@ def finish(key, w, j, c1):
         try: return geometry_finish(key, w, j, c1)
         except (ValueError, subprocess.CalledProcessError) as e: return 'geometry failed', str(e)[:160], None
     if j['stage'] == 'vs': spv_single_lane(os.path.join(w, key + '.spv'))   # one-lane subgroups (see spv_single_lane)
-    r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
+    r = subprocess.run(['spirv-cross', *dmsh_atomic.cross_args(XC, os.path.join(w, key + '.spv')), os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL failed', r.stderr.strip()[:160], None
     src = open(msl).read()
     if j['stage'] == 'vs':   # second pass: re-translate with inputs that are only used as integers reported as uint (see int_inputs)
@@ -855,10 +868,10 @@ def finish(key, w, j, c1):
             rx = subprocess.run([XLATE, jp, w], capture_output=True, text=True)
             if rx.returncode or not os.path.exists(os.path.join(w, key + '.spv')): return 'translation failed', ('integer-input retranslation: ' + rx.stderr.strip())[:160], None
             spv_single_lane(os.path.join(w, key + '.spv'))
-            r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
+            r = subprocess.run(['spirv-cross', *dmsh_atomic.cross_args(XC, os.path.join(w, key + '.spv')), os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
             if r.returncode: return 'MSL failed', r.stderr.strip()[:160], None
             src = open(msl).read()
-    try: src = dmsh_atomic.lower_msl(src)
+    try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src); open(msl, 'w').write(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     pad = []
