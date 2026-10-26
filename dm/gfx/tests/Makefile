@@ -73,6 +73,19 @@ thermal-tsan: t_thermal_tsan
 run: check_t_thermal
 t_fuse_check: t_fuse_check.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_fuse_check.m $(MTL_T_SRC) $(FW)
+t_perf_order: t_perf_order.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_perf_order.m $(MTL_T_SRC) $(FW)
+t_perf_order_tsan: t_perf_order.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -fsanitize=thread -o $@ t_perf_order.m $(MTL_T_SRC) $(FW)
+.PHONY: perf-order-tsan
+perf-order-tsan: t_perf_order_tsan
+	./t_perf_order_tsan --cpu
+.PHONY: check_t_perf_order
+check_t_perf_order: t_perf_order
+	MTL_DEBUG_LAYER=1 ./t_perf_order
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_perf_order
+	DM_NVN_FAST_WAKE=0 DM_NVN_SLICE_MERGE=0 DM_NVN_CS_HOIST=0 MTL_DEBUG_LAYER=1 ./t_perf_order
+run: check_t_perf_order
 t_cube_placeholder: t_cube_placeholder.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cube_placeholder.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_cube_placeholder
@@ -93,6 +106,12 @@ t_present_rescue: t_present_rescue.m t_present_rescue_focus.c $(MTL_T_DEP)
 check_t_present_rescue: t_present_rescue
 	MTL_DEBUG_LAYER=1 ./t_present_rescue --metal
 run: check_t_present_rescue
+t_present_alloc: t_present_alloc.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_present_alloc.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_present_alloc
+check_t_present_alloc: t_present_alloc
+	MTL_DEBUG_LAYER=1 ./t_present_alloc
+run: check_t_present_alloc
 t_present_snap: t_present_snap.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_present_snap.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 .PHONY: check_t_present_snap
