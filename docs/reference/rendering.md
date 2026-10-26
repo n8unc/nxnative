@@ -14,9 +14,11 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 
 ### New textures start as zero
 
+- **Symptom:** a decoded movie stays black even though its YUV textures contain the picture; disabling its depth test makes it visible.
 - **Cause:** Metal leaves a new texture's content undefined; a freshly mapped Switch memory pool reads as 0, and feedback effects (such as Mario's fountain wave simulation, [Metal 4 does not order operations inside one encoder](#metal-4-does-not-order-operations-inside-one-encoder)) never clear their state texture.
-- **Fix:** non-packaged colour textures are zero-filled from a shared zero buffer when created (`tex_zero_fill`, batched with the uploads).
-- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
+- **Fix:** non-packaged colour textures are zero-filled from a shared zero buffer when created (`tex_zero_fill`, batched with the uploads). Depth and stencil textures, including multisample textures, are cleared to zero in render passes in the same upload batch, for every level and slice. Upload-failure recovery tracks these destinations too.
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md); [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md): the opening movie's YUV conversion uses GEQUAL against a new 1920×1080 depth texture that the game never clears. Metal supplied depth 1, discarding the movie; zero initialization restores it without a shader override.
+- **Check:** `t_clear_ds` poisons depth and stencil before calling the real initializer and checks both become zero; depth clear, stencil-view and upload-budget tests cover the related paths.
 
 ### Texture swizzle through swizzled Metal views
 
@@ -582,7 +584,7 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 ### Depth-stencil copies carry the stencil
 
 - **Symptom:** no ambient occlusion (Mac); on a device the result depends on whatever that memory holds.
-- **Cause:** the depth downsample copy left the stencil as the new texture's undefined content (new depth-stencil textures are not zero-filled).
+- **Cause:** the depth downsample copy left the stencil as the destination's previous content (at the time, new depth-stencil textures were not zero-filled either).
 - **Fix:** the copy now carries the stencil.
 - **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md): the occlusion pass (`aa05724ffa62cb82`, a 480×270 R8 target cleared to 1.0) only writes where stencil bit 1 of the quarter-size depth-stencil copy is clear, so on the Mac the mask kept 1.0 everywhere.
 

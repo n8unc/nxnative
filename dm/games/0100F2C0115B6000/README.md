@@ -59,6 +59,7 @@ Game-specific findings. The general host changes they led to are listed under [F
 
 ## Files and shaders
 
+- **Current: prewarm capture reported in [PR #261](https://github.com/seedds/nxnative/pull/261).** The seed in `pso_manifest.tsv` contains 1,537 shader, 2,512 render-pipeline and 43 compute-pipeline rows, recorded on an M2 iPad Pro with update 1.4.3 on 2026-10-25 over about 33 minutes: boot, title, a save load and overworld exploration. The author reports no pipeline compilations in the second session's long frames with this list. This covers the recorded route, not the whole game; no new gameplay or cold-install validation here. The capture is separate from the shared deswizzle and symbol-index optimizations.
 - Most RomFS files are zstd with dictionaries (`*.zs`); the dictionaries are `Pack/ZsDic.pack.zs`, which is also the profile's `romfs_marker`.
 - Shaders: `Shader/*.bfsha.zs` (BNSH; `material.bfsha` holds most) and the layout shaders in `Shader/ApplicationPackage.Nin_NX_NVN.release.sarc.zs`.
 - **Resolved in the host: duplicate pipeline keys from unused colour state.** MacNativeGames commit `f3e2f66`, reported in [PR #196](https://github.com/seedds/nxnative/pull/196), found 8,479 of 24,146 recorded render pipelines (35%) differed only in unused state. The general normalization and prewarm deduplication are ported; this is the source project's measurement, with no new gameplay or prewarm-count measurement on this game here.

@@ -47,6 +47,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 
 ## Engine frame limiters
 
+### Unity's integer target frame rate
+
+- **Symptom:** menus reach 60 fps with `present_interval display`, but entering gameplay returns to 30 fps despite spare GPU time.
+- **Cause:** the game sets Unity's `Application.targetFrameRate` to 30. Changing NVN's present pacing does not change the engine's own limiter.
+- **Fix:** `hle_fpslock.c` supports integer FPS fields alongside float FPS, milliseconds and vsync counts. Its build-gated row keeps the verified field at the profile's `fps_target` (`DM_FPS_TARGET` overrides it), preserving unset values such as 0 and -1. `present_interval display` removes the separate interval-2 present cap.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md), 1.3.0; its note records the setter, field and gameplay timing checks.
+- **Check:** `t_fpslock` exercises the production write path, build mismatch, disabled override, repeated game writes, unset values and 30 fps fallback, plus the existing float, millisecond and two-copy vsync paths.
+
 ### A render-thread limiter with a constant and a fixed time step
 
 - **Symptom:** the game presents at interval 1, yet every frame takes exactly 33.3 ms of "frame work"; after only the limiter was raised, everything ran twice as fast on the iPhone.
