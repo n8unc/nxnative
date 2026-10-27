@@ -133,6 +133,20 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md) (Unreal Engine 4.18 flags its streamed and CPU-loaded textures sparse).
 - **Check:** the map's guest bytes deswizzled in Python at 1 to 32 GOBs read right only at 8; a 512×512 RGBA8 sprite sheet only at 16; [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md)'s packaged ASTC 6×6 textures (16 bytes per block) carry 8 in their layout. The 1- and 2-byte heights follow the same tile shapes and were not seen.
 
+### Sparse textures of 8- and 16-byte blocks: blocks at most 8 GOBs high
+
+- **Symptom:** crashes that move between runs (30–70% of boots, in the first minute): in the allocator, on bogus pointers, in unrelated threads. Unreal's purgatory proxy ([05-debugging](../agents/05-debugging.md)) finds freed 64 KB-aligned blocks modified; with the parked blocks read-only, the faulting store is a `memcpy` of texture mip data from the texture streamer into the buffer `RHILockTexture2D` returned.
+- **Cause:** with the automatic block height the host gave sparse textures the same block height as plain ones (16 GOBs for 96 or more block rows), so a 64 KB tile was 8 GOBs wide. For 8- and 16-byte blocks (DXT1, DXT5 and the like) the real layout uses blocks of at most 8 GOBs and so tiles 16 GOBs (1,024 bytes) wide: the game's pre-swizzled data for a 384×384 DXT5 level is 32 GOBs × two 8-GOB block rows, 0x40000 bytes, where the host's layout said 0x30000 (the padding sits at the end of each 8-GOB block in the dump). 4-byte texels keep 16-GOB blocks (a 1350×270 BGRA8 level is 88 GOBs × three 16-GOB block rows, 0x210000 bytes). Unreal's NVN RHI sizes its lock buffer from the host's level layout and copies the cooked level in at its own size, past the end of the buffer.
+- **Fix:** `nvn_tex.c` `sparse_tile_h` (see [Sparse textures take the block height of their 64 KB tile](#sparse-textures-take-the-block-height-of-their-64-kb-tile)): a sparse texture without a packaged layout and with 8 or 16 bytes per block takes 8-GOB blocks. `dm/gfx/tests/t_sparse_layout.c` checks 15 measured textures and Monster Hunter Rise's level offsets.
+- **Found on:** [Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md): 9 streamed DXT5 textures (384×384 to 1920×912) overran their buffers by 0x8000–0x20000 bytes; after the fix none of 10,578 level copies did, and 10 of 10 boots ran clean.
+
+### Sparse textures smaller than a tile keep the automatic block height
+
+- **Symptom:** a small CPU-filled sparse texture shows part of its image beside fragments, cut off at the bottom (Yoshi's Crafted World's loading icon: the left half of a chalk drawing and two stray strokes).
+- **Cause:** a sparse texture smaller than one 64 KB tile in width or height is all mip tail, laid out as a plain texture with the [automatic block height](#automatic-block-height-truncates), but the host gave every sparse texture its tile's block height. The 192×160 DXT5 icon (12 × 5 GOBs, under the 16 × 8 GOBs of a 16-byte tile) is laid out in 4 GOBs and was read with 8; a 384×384 DXT1 (12 GOBs wide, under the 16-GOB tile width, 96 block rows) in 16, also read with 8. The storage sizes stay the same, so only the picture shows it.
+- **Fix:** `nvn_tex.c` `nvn_tex_layout` gives a sparse texture its tile's block height only when level 0 is at least one tile wide and high, the test `level_walk` uses for padding; the tile's shape for that test and for `nvn_tex_sparse_tiles` comes from the block size (`tile_shape_h`), not from the block height the texture got. `t_tex_layout.c` checks both block heights and the icon's tile shape.
+- **Found on:** [Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md): the guest bytes of the icon and of the DXT1 deswizzled in Python read right only at 4 and 16 GOBs; its 384×384 DXT5 (24 GOBs wide, at least one tile) still reads right only padded to 32 GOBs at 8.
+
 ### Sparse textures bound from their first mapped level
 
 - **Symptom:** streamed textures read 0 (magenta on Monster Hunter Rise's title screen's clothes).
@@ -328,9 +342,17 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 
 - **Symptom:** text a game renders into textures for the title and the menus comes out upside down, while the scene looks right.
 - **Cause:** a game that never calls `nvnDeviceSetWindowOriginMode` keeps NVN's default, lower-left (OpenGL), where NDC y = -1 lands on a render target's first memory row. Read as upper-left, every texture the game renders and samples came out flipped and cancelled out, but not the text, and the game copies the frame with `MIRROR_Y`.
-- **Fix:** viewport and scissor rectangles, fragment coordinates, copies and texture coordinates address the same memory rows in both conventions, so the host only flips the direction inside the viewport (negative viewport height), reverses the front-face winding, and flips the window image at present and in raw screenshots (`g_origin_ll` in `nvn_mtl.m`).
+- **Fix:** viewport and scissor rectangles, fragment coordinates, copies and texture coordinates address the same memory rows in both conventions, so the host flips the direction inside the viewport (negative viewport height) and flips the window image at present and in raw screenshots (`g_origin_ll` in `nvn_mtl.m`). Facing also follows the [raster flip captured at queue initialization](#queue-initialization-captures-the-raster-origin).
 - **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md); the six games before it all switch to upper-left.
 - **Note:** the window's Y-direction system register under this origin is open ([Open: the window Y-direction register `SR_Y_DIRECTION`](shaders.md#open-the-window-y-direction-register-sr_y_direction)); the OpenGL layer renders through this origin ([GL orientation through the lower-left origin](#gl-orientation-through-the-lower-left-origin)), and Absolum combines it with a viewport swizzle ([Viewport swizzles applied as a flipped viewport](#viewport-swizzles-applied-as-a-flipped-viewport)).
+
+### Queue initialization captures the raster origin
+
+- **Symptom:** geometry appears inside out and almost black; a fullscreen indirect-lighting triangle is entirely culled even though its vertex data and polygon state match the game.
+- **Cause:** NVN emits `SET_WINDOW_ORIGIN.FLIP_Y` into a queue's initial GPU state. `DeviceSetWindowOriginMode` only changes the device field that later viewport construction reads; it does not rewrite an existing queue's raster flip. Deriving Metal winding from the current device origin loses this distinction when the game creates a queue before changing the origin. Reversing winding globally fixes that sequence but breaks games that set their origin first.
+- **Fix:** `queue_t.origin_ll` captures the device origin in `nvnQueueInitialize`. Each submission selects that queue's raster origin under the submission lock. Metal winding uses this captured origin; viewport direction and presentation keep using the device origin. The full-coverage proof also accounts for the difference between these origins, and for a negative-Y viewport swizzle.
+- **Check:** `t_queue_origin` alternates two queues created with different origins on one device. GPU readback checks CW/CCW triangles, both current device origins, every cull mode, `front_facing`, negative-Y swizzles and the full-coverage proof: 389 checks pass with direct and deferred Metal encoding; restoring the previous winding expression fails 48. The complete Metal suite passes. Mario Wonder's full smoke route passes with the fix.
+- **Found on:** [Xenoblade Chronicles 2](../../dm/games/0100E95004038000/README.md#rendering), with native SDK initialization evidence and the comparison with Mario Wonder recorded there.
 
 ### The residency set committed before a present
 
@@ -390,6 +412,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** the builder's mode now goes to the texture (`tex_t.stencil`), whose sampling view is the `X32_Stencil8` one a stencil-mode texture view already got.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the character occlusion mask, `edbfc7a088be545e`).
 
+### Conservative rasterization remains unimplemented
+
+- **Symptom:** `[nvn] SetConservativeRasterEnable on: ignored by host for now`, followed by `[RED] NVN unimplemented function called: nvnCommandBufferSetConservativeRasterDilate`.
+- **Cause:** `hle_nvn.c` ignores the enable setter and has no implementation for the dilation setter. The requested raster coverage state never reaches Metal.
+- **Fix:** **Open.** Neither setter has been implemented. The opening indoor scene renders and accepts input, but the visual contribution of the missing coverage state has not been isolated. The diagnostic remains visible.
+- **Found on:** [Pokémon Scarlet](../../dm/games/0100A3D008C5C000/README.md#open) (1.0.0, the first playable bedroom).
+
 ## Vertex input and draws
 
 ### Integer vertex inputs
@@ -422,6 +451,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** `dm/gfx/tests/t_pull.m` (the words against Metal's fetch and the CPU conversion), `t_pull_inv.m` (a depth prepass with one pipeline and depth-equal with the other), `test_dmsh_pull.py`; `dm/ios/tests/test_profile_pack.py` packs tiny fixtures through the actual archive step and checks profile defaults, explicit overrides and an IPA with a pipeline archive in the ZIP.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): draws that waited for their pipeline on a cold start.
 
+### Float32 vertex padding through integer inputs
+
+- **Symptom:** a fullscreen post-process draw writes no color, then a later blur composite darkens scenery while the character remains visible.
+- **Cause:** reinterpreting Float1/2/3 as UInt1/2/3 preserves supplied bits but pads missing `w` with integer `1`. A shader that bitcasts the input back to float receives `w=1.4e-45`, rather than `1.0`, and can clip the whole draw. Float4 has no missing components.
+- **Fix:** short float32 vectors use the existing float shadow input, or CPU expansion with float `(0,0,0,1)` defaults when shadows are unavailable or disabled. Float4 keeps direct reinterpretation. `t_float_pad` checks signed/unsigned GPU fetch, CPU fallback and Float4 controls.
+- **Found on:** [Xenoblade Chronicles: Definitive Edition](../../dm/games/0100FF500E34A000/README.md) (the game profile is a separate, pending contribution).
+
 ### CPU conversion of vertex attributes the input type cannot take
 
 - **Symptom:** `Vertex attribute m_36(5) of type uint4 cannot be read using MTLAttributeFormatHalf2` (draws dropped: black silhouettes); UVs collapse onto one texel (flat tan characters); vertices far out of view (negative 16-bit values widened with zeros).
@@ -444,6 +480,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Cause:** the host bound NVN stream *n* to Metal vertex buffer 16 + *n*, but Metal has slots 0–30 only (30 is the host's constant fallback), so stream 15 went to 31.
 - **Fix:** translated shaders use only `buffer(0)`, so streams 14 and 15 now go to slots 14 and 15 (`VB_SLOT`).
 - **Found on:** [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (a minute and a half into the prologue).
+
+### Vertex streams at addresses that are not 4-byte aligned
+
+- **Symptom:** Scaleform fills come out as solid white or light grey sheets over the whole screen, hard-edged triangles and bands, and the menu text is missing (a language list or a title screen that is all white behind its button prompt).
+- **Cause:** Metal reads a vertex buffer only from a 4-byte-aligned address: bound at an address 2 mod 4, every vertex was read 2 bytes early. NVN takes any address, and Scaleform's vertex streams (16-byte vertices: two RGBA8 attributes and an RG32F position) sit at addresses such as `…6d6a`. The positions became garbage spanning the screen, and the shapes, white with alpha 0.2–0.7 by their colour transforms, overlapped many times.
+- **Fix:** `bind_vbufs` copies a stream whose address is not 4-byte aligned into the submission's arena (`vbuf_unaligned`; one copy per address and size until guest writes or pool mappings change, up to 64 MB) and binds the copy. CPU copies require a host-readable, non-sparse range without pending GPU writers in this or an earlier submission; otherwise `vbuf_prepare` encodes an ordered GPU copy before the render encoder, including feedback and geometry captures. Submissions and pool mappings invalidate copies; buffer and shader writes invalidate the copies they can overlap, so unrelated uniform updates keep their vertex copies. The log's `vertex bindings` line counts the copies; `t_vbuf` checks byte-aligned readbacks, reuse, queued writes, writes between draws and pool replacement. The index buffers at addresses 2 mod 4 (16-bit indices) needed nothing.
+- **Found on:** Batman: Arkham Knight (`0100ACD0163D0000`; its profile and note are in a PR of their own) (Scaleform GFx; 2–13 copies of 3–18 MB a frame in the menus and at the title, which the draws' vertex ranges could narrow). With the copy the language menu and the title screen draw right.
 
 ### Programs bound per stage
 

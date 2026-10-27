@@ -30,7 +30,9 @@ None of them has a default game: without one they stop and list the profiles. To
 - `python3 dm/games/game.py list` lists the profiles.
 - `python3 dm/games/game.py <id> <key>` prints one key.
 
-**Launcher settings.** `settings.tsv` lists the player-facing settings once (the environment variable each sets, its kind, default, the condition under which a game offers it and its section on the single settings screen, **Game**, **Controls** or **Performance**; Reset to tested defaults forgets all launcher choices so the profile's defaults apply again; its header describes the columns). A profile key a setting defaults to (`DM_GAME_<NAME>`) is the value the game was tested with, which the player page [docs/settings.md](../../docs/settings.md#tested-defaults) explains. `build_ipa.sh` runs `settings.py <id> <rewritten modules> <control.nacp> <out.json>`, which keeps the rows that hold for the game: a profile macro (`DM_GAME_FPS_TARGET!=0`), a key in `main`'s rewriter table (`RENDER_SCALE`, written by `patch_nso.py` for the builds with a render-scale stub), the game's languages. It writes them into the app as `dm/launcher.json`, from which the iOS launcher (`dm/ios/Sources/Launcher.swift`) draws its screen. A new player setting is one row; diagnostic switches stay environment-only.
+**Launcher settings.** `settings.tsv` lists the player-facing settings once (the environment variable each sets, its kind, default, the condition under which a game offers it and its section on the single settings screen, **Game**, **Controls** or **Performance**; Reset to tested defaults forgets all launcher choices so the profile's defaults apply again; its header describes the columns). A profile key a setting defaults to (`DM_GAME_<NAME>`) is the value the game was tested with, which the player page [docs/settings.md](../../docs/settings.md#tested-defaults) explains. `build_ipa.sh` runs `settings.py <id> <rewritten modules> <control.nacp> <out.json>`, which keeps the rows that hold for the game: a profile macro (`DM_GAME_FPS_TARGET!=0`), a key in `main`'s rewriter table (`RENDER_SCALE`, written by `patch_nso.py` for the builds with a render-scale stub), the game's languages. It writes them into the app as `dm/launcher.json`, from which the iOS launcher (`dm/ios/Sources/Launcher.swift`) draws its screen; the NSP script packs the Mac app's copy (`SETTINGS_PLATFORM=mac`, without the rows marked `platform:ios`, `Contents/Resources/dm/launcher.json`) for a Mac front end, which shows the list and starts the app with the chosen values in its environment. A new player setting is one row; diagnostic switches stay environment-only.
+
+Defaults may use `<ios>|<mac>` to select the platform's value before resolving a profile macro or build variable. For example, `DM_GAME_PSO_MTL4|1` follows the profile on iOS and the Mac host's always-on default on Mac; `1|0` matches the encode thread's iOS-on, Mac-off defaults. `SETTINGS_PLATFORM` accepts `ios` (the default) or `mac`; other values are rejected.
 
 ## Games
 
@@ -92,6 +94,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Pikmin 4](0100B7C00933A000/README.md) | `0100B7C00933A000` | 1.1.1 | 10.4.8 | Unreal Engine 4.26.2 | NVN |
 | [Pokémon Brilliant Diamond](0100000011D90000/README.md) | `0100000011D90000` | 1.3.0 | 11.4.3 | Unity 2019.4.27f1 IL2CPP | NVN |
 | [Pokémon Legends: Z-A](0100F43008C44000/README.md) | `0100F43008C44000` | 2.0.2 | 19.3.11 | Game Freak's Trinity engine | NVN |
+| [Pokémon Scarlet](0100A3D008C5C000/README.md) | `0100A3D008C5C000` | 1.0.0 | 13.3.5 | Game Freak's Trinity engine | NVN |
 | [Pokémon Shield](01008DB008C2C000/README.md) | `01008DB008C2C000` | 1.3.2 | 7.3.2 | Game Freak's engine (before Trinity) | NVN |
 | [Pokémon Sword](0100ABF008968000/README.md) | `0100ABF008968000` | 1.3.2 | 7.3.2 | Game Freak's engine (before Trinity) | NVN |
 | [Portal](01007BB017812000/README.md) | `01007BB017812000` | 1.0.3 | 13.3.0 | Valve's Source engine (28 NROs) | NVN |
@@ -115,7 +118,9 @@ One row per profile; the notes are each profile's `README.md`.
 | [The Legend of Zelda: Link's Awakening](01006BB00C6F0000/README.md) | `01006BB00C6F0000` | 1.1.0 | 8.2.0 | Grezzo's engine on NintendoWare | NVN |
 | [The Legend of Zelda: Tears of the Kingdom](0100F2C0115B6000/README.md) | `0100F2C0115B6000` | 1.4.3 | 20.5.22 | Nintendo EPD (sead / agl / gsys) | NVN |
 | [Unicorn Overlord](010069401ADB8000/README.md) | `010069401ADB8000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN |
+| [Xenoblade Chronicles 2](0100E95004038000/README.md) | `0100E95004038000` | 2.1.0 | 3.5.0 | Monolith's engine | NVN |
 | [Xenoblade Chronicles 3](010074F013262000/README.md) | `010074F013262000` | 2.2.1 | 12.3.9 | Monolith's engine | NVN |
+| [Yoshi's Crafted World](01006000040C2000/README.md) | `01006000040C2000` | 1.0.1 | 4.4.1 | Unreal Engine 4.18 era (Good-Feel) | NVN |
 
 ## Keys
 

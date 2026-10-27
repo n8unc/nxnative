@@ -15,8 +15,10 @@ BOTW, WONDER = '01007EF00011E000', '010015100B514000'
 PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
 
 
-def build(gid, api):
-    with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US']), patch.dict(os.environ, {'GFXAPI': api}):
+def build(gid, api, platform=None):
+    env = {'GFXAPI': api, **({'SETTINGS_PLATFORM': platform} if platform else {})}
+    with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US']), patch.dict(os.environ, env):
+        if not platform: os.environ.pop('SETTINGS_PLATFORM', None)
         return {s['env']: s for s in settings.build(gid, tmp, Path(tmp) / 'control.nacp')['settings']}
 
 
@@ -53,6 +55,33 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual((s['on'], s['off'], s['default']), ('on', 'off', 'on'))
         s = build(BOTW, 'nvn')['DM_SHOW_FPS']
         self.assertEqual((s['on'], s['off']), ('1', '0'))
+
+    def test_iphone_switches_only_on_the_iphone(self):   # the frame-rate counter and touch feedback are the iOS front end's (front_ios.m, DmGamepad.m)
+        ios, mac = build(BOTW, 'nvn'), build(BOTW, 'nvn', 'mac')
+        self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
+        self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS'})
+        self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
+
+    def test_defaults_follow_each_platform_host(self):
+        # nvn_mtl.m pso4_on: Mac defaults on, iOS follows the profile. nvn_rec.h rec_on: iOS on, Mac off.
+        for gid, ios_pso in ((BOTW, '1'), (WONDER, '0')):
+            with self.subTest(game=gid):
+                ios, mac = build(gid, 'nvn', 'ios'), build(gid, 'nvn', 'mac')
+                self.assertEqual((ios['DM_PSO_MTL4']['default'], ios['DM_NVN_ENC_THREAD']['default']), (ios_pso, '1'))
+                self.assertEqual((mac['DM_PSO_MTL4']['default'], mac['DM_NVN_ENC_THREAD']['default']), ('1', '0'))
+
+    def test_unknown_platform_is_rejected(self):
+        with self.assertRaisesRegex(SystemExit, 'SETTINGS_PLATFORM must be ios or mac'):
+            build(WONDER, 'nvn', 'mca')
+
+    def test_malformed_platform_defaults_are_rejected(self):
+        for default in ('1|', '|0', '1|0|1'):
+            with self.subTest(default=default), tempfile.TemporaryDirectory() as tmp:
+                row = '\t'.join(('DM_X', 'toggle', '-', default, 'always', 'Game', 'X')) + '\n'
+                (Path(tmp) / 'settings.tsv').write_text(row, encoding='utf-8')
+                with patch.object(settings, 'HERE', Path(tmp)), patch.object(settings.nacp, 'languages', return_value=['en-US']), \
+                        self.assertRaisesRegex(SystemExit, 'platform default'):
+                    settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
 
     def test_table_format_is_strict(self):
         good = 'DM_X\ttoggle\t-\t0\talways\tGame\tX\n'

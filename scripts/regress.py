@@ -6,6 +6,8 @@
 # Usage: python3 scripts/regress.py check    [--baseline REV] [--candidate REV|worktree] [--quick] [--games ID,...] [--no-smoke] [--out DIR]
 #        python3 scripts/regress.py baseline [--rev REV] [--quick] [--games ID,...] [--runs N]
 #        python3 scripts/regress.py chain    [--baseline REV] [--candidate REV|worktree] [--games ID,...]          (the static checks only, no game runs)
+#        python3 scripts/regress.py usage    [--rev REV] [--games ID,...] [--write]                            (a game's usage manifest, dm/games/<id>/usage.tsv: dm/tools/usage.py)
+#        python3 scripts/regress.py impact   <base>..<head> | <commit>                                         (the games whose manifests hold what the change touches)
 #        python3 scripts/regress.py list                                                                       (the games found, their routes and stored baselines)
 #   REV: any git revision of this repository; worktree = this checkout as it is, uncommitted and untracked files included. check: baseline = the merge base of HEAD and main,
 #   candidate = worktree; baseline: --rev main. Each revision is checked out once into <root>/trees/<id> (git worktree), and the chain, host and rewriter come from there.
@@ -66,6 +68,7 @@ def load_module(name, path):   # a module from a file (another script, or a tool
 
 bench = load_module('bench', REPO / 'scripts/bench.py')
 shader_regressions = load_module('shader_regressions', REPO / 'dm/gfx/tools/shader_regressions.py')
+usage = load_module('usage', REPO / 'dm/tools/usage.py')   # usage manifests and change impact (regress.py usage / impact)
 ROOT = Path(os.environ.get('REGRESS_ROOT', '/Volumes/NX/harness'))
 GAMES = Path(os.environ.get('REGRESS_GAMES', '/Volumes/NX/games'))
 HOST_DIRS = ('dm/host', 'dm/gfx', 'dm/gfx/nvn', 'dm/gfx/nvn/include', 'dm/gfx/tex', 'dm/gfx/vk', 'dm/gfx/gl')   # as build_ipa_from_nsp.py: the host's sources and headers
@@ -172,8 +175,8 @@ class Game:
         self.derived = (build / 'profile' / self.id / 'game.tsv').is_file()
 
     def romfs(self):
-        r = self.build / 'extract' / self.ver / 'RomFS'
-        return r if r.is_dir() else bench.newest(self.build.glob('extract/v*')) / 'RomFS'
+        r = bench.rfs.source(self.build / 'extract' / self.ver)
+        return r if r.is_dir() else bench.rfs.source(bench.newest(self.build.glob('extract/v*')))
 
     def route(self):
         f = REPO / 'dm/games' / self.id / 'smoke.tsv'
@@ -246,7 +249,8 @@ def dotnet_env(env):
 def toolchain_fp():
     out = []
     for cmd in (['spirv-cross', '--version'], ['xcrun', '-sdk', 'macosx', 'metal', '--version'], ['xcrun', '-sdk', 'macosx', '--show-sdk-build-version']):
-        r = sh(cmd); out.append(r.stdout + r.stderr)
+        try: r = sh(cmd); out.append(r.stdout + r.stderr)
+        except FileNotFoundError: out.append('missing')   # spirv-cross on PATH: only revisions before the in-repo build (dm/gfx/tools/spirv_cross_bin) run it; a tree's own is in its chain key
     return hashlib.sha256('\0'.join(out).encode()).hexdigest()
 
 
@@ -265,6 +269,11 @@ def chain_key(tree, g, tools):
         vk = load_module('regress_vk_sources', REPO / 'dm/gfx/tools/vk_shaders.py')
         sources = digest(sorted(Path(p) for root in g.shader_roots() for p in vk.spirv_files(root)), root=g.build)
     else: raise HarnessError(f'{g.id}: the chain check does not cover {g.kind} games yet')
+    sc = tree.path / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'
+    if sc.is_file():   # earlier revisions use PATH, already covered by tools; pinned revisions also honor SPIRV_CROSS
+        env = dotnet_env(g.env(tree))
+        selected = env.get('SPIRV_CROSS', str(sc))
+        side += digest([Path(shutil.which(selected, path=env.get('PATH')) or selected)])
     return v, inp, f'{g.kind}-{v}-{inp}-{hashlib.sha256((tools + side + sources).encode()).hexdigest()[:16]}'
 
 
@@ -323,7 +332,7 @@ def chain_build(tree, g, a):
 def refl_hash(p):
     try: j = json.loads(Path(p).read_bytes())
     except (OSError, ValueError): return None
-    for k in ('chain', 'chain_metal'): j.pop(k, None)
+    for k in ('chain', 'chain_metal', 'chain_compiler'): j.pop(k, None)
     return hashlib.sha256(json.dumps(j, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -1016,6 +1025,74 @@ def cmd_check(a, smoke=True):
     return finish(rep, a)
 
 
+def cmd_usage(a):
+    """The usage manifest of each game (dm/tools/usage.py): shader features of the revision's chain build, and what one run of the route's quick part calls"""
+    tree = Tree(a.rev); games = select(a, smoke=True)
+    for g in games:
+        art = artifacts(tree, g, a, rewrite=a.rewrite)
+        rows = collections.Counter()
+        if g.kind == 'nvn':
+            ff = art['lib'] / 'features.json'
+            if not ff.is_file(): say(f'  {g.id}: shader features of chain {art["manifest"]["chain"]}'); ff.write_text(json.dumps(usage.shader_features(next(art['lib'].glob('b-*')))))
+            for k, n in json.loads(ff.read_text()).items(): rows['shader', k] = n
+        for ln in (g.profile_dir(tree) / 'game.tsv').read_text().splitlines():
+            if ln and not ln.startswith('#') and '\t' in ln: rows['key', ln.split('\t')[0]] = 1
+        route = g.route()
+        if route and not a.no_smoke:
+            g.get_depth_zero = depth_zero(g, tree)
+            r2 = dict(route, shots=[])
+            d = game_root(g) / 'runs' / f'{datetime.datetime.now():%Y%m%d-%H%M%S}-usage'   # the run's logs stay in the NSP folder, as check's runs
+            a.env = list(a.env) + ['DM_HLECOUNT=hlecount.tsv', 'DM_NVN_TSV_CALLS=1']
+            say(f'  {g.id}: usage run ({route["quick"]:g} s) → {d}')
+            res = smoke_run(g, tree, art, r2, True, d, a)
+            a.env = a.env[:-2]
+            if run_failures(res, route): say(f'    [RED] the run failed ({"; ".join(run_failures(res, route))}): its usage rows are incomplete')
+            rows.update(usage.runtime_usage(d, g.kind if g.kind != 'vk' else 'vulkan'))
+        else: rows['api', g.kind if g.kind != 'vk' else 'vulkan'] = 1
+        out = ROOT / g.id / 'usage' / f'{tree.id}.tsv'; out.parent.mkdir(parents=True, exist_ok=True)
+        head = f'{g.name} ({g.id}), revision {tree.commit[:12]}, chain {art["manifest"]["chain"]}, ' + (f'route smoke.tsv quick ({route["quick"]:g} s)' if route and not a.no_smoke else 'no run')
+        usage.write_manifest(out, rows, head)
+        kinds = collections.Counter(k for k, _ in rows)
+        say(f'  {g.id}: {", ".join(f"{k} {n}" for k, n in sorted(kinds.items()))} → {out}')
+        if a.write:
+            dst = REPO / 'dm/games' / g.id / 'usage.tsv'; shutil.copyfile(out, dst); say(f'    written to {dst}')
+    return 0
+
+
+def cmd_impact(a):
+    """The games a git range can affect (dm/tools/usage.py impact), from the usage manifests of this checkout's profiles"""
+    rng = a.range if '..' in a.range else f'{a.range}^..{a.range}'
+    for rev in rng.split('..'):   # read from git only: no checkout and no harness root, as a contributor without the games has neither
+        if sh(['git', 'rev-parse', '--verify', '--quiet', (rev or 'HEAD') + '^{commit}'], cwd=REPO).returncode: raise HarnessError(f'impact: {rev} is not a revision of this repository')
+    manifests = {}
+    for d in sorted((REPO / 'dm/games').iterdir()):
+        if (d / 'game.tsv').is_file(): manifests[d.name] = usage.read_manifest(d / 'usage.tsv') if (d / 'usage.tsv').is_file() else None
+    for extra in a.manifest:   # a manifest from <root>/<id>/usage/ that is not committed yet
+        manifests[Path(extra).parent.parent.name] = usage.read_manifest(extra)
+    r = usage.impact(rng, manifests)
+    names = {d.name: (d / 'README.md').read_text(errors='replace').split('\n', 1)[0].lstrip('# ').split(' (`')[0] if (d / 'README.md').is_file() else d.name for d in (REPO / 'dm/games').iterdir() if d.is_dir()}
+    st = collections.Counter(v['status'] for v in r['games'].values())
+    L = [f"## regress.py impact `{rng}`", '', f"{st['affected']} games use what the change touches, {st['broad']} only through a broad rule (every game of its API), {st['not affected']} not affected, {st['unknown']} unknown (no usage manifest); "
+         f"{len(r['changed'])} files changed, {len(r['names'])} NVN / HLE entry points reached through the host's callers, {len(r['patterns'])} rules of dm/tools/impact_map.tsv", '',
+         '| game | status | what it uses of the change (kind: name ×count; for broad, the broad rows) |', '|---|---|---|']
+    order = {'affected': 0, 'broad': 1, 'not affected': 2, 'unknown': 3}
+    for gid, v in sorted(r['games'].items(), key=lambda x: (order[x[1]['status']], x[0])):
+        if v['status'] == 'unknown' and not a.all: continue
+        ms = v.get('narrow') or v['matches']
+        top = ', '.join(f'{k}: {n} ×{c}' for k, n, c, _ in ms[:6]) + (f' … ({len(ms)} in all)' if len(ms) > 6 else '')
+        L.append(f"| {names.get(gid, gid)} `{gid}` | {v['status']} | {top} |")
+    if st['unknown'] and not a.all: L += ['', f"Unknown (no usage.tsv): {st['unknown']} profiles (--all lists them)."]
+    L += ['', '### Why', ''] + [f'- `{p}` ← {w}' for p, w in r['patterns']] + [f'- `{k}:{n}` ← {w}' for k, n, w in r['names'][:30]] + (['- … more entry points'] if len(r['names']) > 30 else [])
+    if r['unmapped']: L += ['', 'Changed files no rule maps (add them to dm/tools/impact_map.tsv): ' + ', '.join(f'`{f}`' for f in r['unmapped'])]
+    md = '\n'.join(L) + '\n'
+    out = Path(a.out) if a.out else ROOT / 'reports' / f'{datetime.datetime.now():%Y%m%d-%H%M%S}-impact' if ROOT.is_dir() else None   # without a harness root, the report is only printed
+    if out:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'impact.json').write_text(json.dumps({'schema': 'nxnative-impact/1', 'range': rng, **r}, indent=1, default=list)); (out / 'impact.md').write_text(md)
+    say(md + (f'\nreport: {out / "impact.md"}' if out else ''))
+    return 0
+
+
 def select(a, smoke):
     games = find_games(a.games.split(',') if a.games else None)
     if not games: raise HarnessError(f'no game with a Mac build under {GAMES}')
@@ -1126,19 +1203,25 @@ def main():
     p = sub.add_parser('baseline', help='record the runs of a revision'); p.add_argument('--rev', default='main'); common(p)
     p = sub.add_parser('check', help='compare a candidate with the stored baseline'); p.add_argument('--baseline'); p.add_argument('--candidate', default='worktree'); common(p)
     p = sub.add_parser('chain', help='the static checks only'); p.add_argument('--baseline'); p.add_argument('--candidate', default='worktree'); common(p, smoke=False)
+    p = sub.add_parser('usage', help='write each game\'s usage manifest (names and counts)'); p.add_argument('--rev', default='worktree'); common(p)
+    p.add_argument('--write', action='store_true', help='also write it to dm/games/<id>/usage.tsv of this checkout')
+    p = sub.add_parser('impact', help='the games a change can affect'); p.add_argument('range', help='<base>..<head>, or one commit')
+    p.add_argument('--manifest', action='append', default=[], help='a usage.tsv not in the profiles yet (<root>/<id>/usage/<tree>.tsv)')
+    p.add_argument('--all', action='store_true', help='list the games without a manifest too'); p.add_argument('--out')
     sub.add_parser('list', help='the games, routes and baselines')
     a = ap.parse_args()
     ROOT, GAMES = Path(a.root), Path(a.games_dir)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a stop runs the finally blocks: a game or a shader build in its own process group is stopped too
     try:
         if a.cmd == 'list': return cmd_list(a)
+        if a.cmd == 'impact': return cmd_impact(a)
         ROOT.mkdir(parents=True, exist_ok=True); (ROOT / 'tmp').mkdir(exist_ok=True)
         if a.cmd == 'chain': a.quick = False; a.no_smoke = True; a.rewrite = False
         a.lock = a.pause_lock = Path(a.lock) if a.lock else None
         a.jobs = a.jobs or os.cpu_count() or 8
         a.tools_fp = toolchain_fp()
         free = check_disk(a.min_free_gb); say(f'internal disk: {free:.1f} GB free; root {ROOT}; {a.jobs} workers')
-        return {'baseline': cmd_baseline, 'check': cmd_check, 'chain': lambda a: cmd_check(a, smoke=False)}[a.cmd](a)
+        return {'baseline': cmd_baseline, 'check': cmd_check, 'usage': cmd_usage, 'chain': lambda a: cmd_check(a, smoke=False)}[a.cmd](a)
     except HarnessError as e:
         print(f'[RED] regress.py: {e}', file=sys.stderr); return 2
 
