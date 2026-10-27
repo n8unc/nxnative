@@ -69,6 +69,8 @@ else:
 #   FRAME_STEP = {build ID: function(ctx)}: the frame step stubs of a main ("Frame step in whole vsyncs" below)
 #   MATCH_CUTS = {module name: [nso_match rule, ...]}: fallback for modules without registered CUTS. Only the profile selected by DM_GAME participates; a derived profile uses
 #     the repository's rules, an external-only provisional profile its own. Missing or ambiguous matches are reported and skipped; known builds retain their exact CUTS.
+#     A rule of several functions applies whole or not at all. For such a module <name>.match.tsv lists the cuts of the profile's registered builds of it and each patch's result,
+#     which the NSP script reports with the build (what an unregistered build lost)
 PATCH_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sdk_patches.py')] + sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games/*/patches.py')))
 # Profiles outside the repository (DM_GAMES_DIR, folders separated by os.pathsep, which is ':' as in dm/games/game.py: the NSP script's provisional profile of a game being brought up) may have a
 # patches.py of their own builds too; they are loaded after the repository's, under the same rule (a build ID claimed twice stops the rewrite)
@@ -98,7 +100,25 @@ cuts = list(PATCHES['CUTS'].get(BUILD_ID, []))
 if BUILD_ID not in PATCHES['CUTS']:
     from nso_match import resolve
     profile = os.path.basename(os.environ.get('DM_GAME', '').rstrip('/'))
-    cuts += resolve(IMG, TEXT_END, PATCHES['MATCH_CUTS'].get(profile, {}).get(NAME, []))
+    rules, outcomes = PATCHES['MATCH_CUTS'].get(profile, {}).get(NAME, []), []
+    cuts += resolve(IMG, TEXT_END, rules, outcomes=outcomes)
+    # the repository profile's build rows (a derived profile replaces them with its own version's): what the registered builds of this module had cut
+    known, rows = [], []
+    try:
+        if profile:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games', profile, 'game.tsv'), encoding='utf-8') as f: rows = f.read().splitlines()
+    except OSError: pass
+    for row in rows:
+        c = [x.strip() for x in row.split('\t')]
+        if c[0] == 'build' and len(c) > 3:
+            bid = dict(x.split('=', 1) for x in c[3:] if '=' in x).get(NAME)
+            if bid and bid != BUILD_ID and PATCHES['CUTS'].get(bid): known.append((bid, c[2], len(PATCHES['CUTS'][bid])))
+    if known or outcomes:
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, NAME + '.match.tsv'), 'w') as f:
+            f.write(f'# {NAME} {BUILD_ID}: not a registered build. registered: build ID, display version, cuts; patch: name, cut offsets or -, implementation or why not\n')
+            for bid, disp, n in known: f.write(f'registered\t{bid}\t{disp}\t{n}\n')
+            for name, offs, why in outcomes: f.write(f'patch\t{name}\t{",".join(f"{o:#x}" for o in offs) if offs else "-"}\t{why}\n')
 for off, ob, nb, why in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
     assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'cut original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'

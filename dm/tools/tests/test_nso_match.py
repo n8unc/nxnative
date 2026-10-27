@@ -1,6 +1,8 @@
 """Function patch recognition through real AArch64 code and synthetic unwind tables.
 No game files. Relocation is accepted; changed logic, callees, ambiguity and wrong
 profile/module selection are refused through the rewriter's actual registry code.
+A patch of several functions applies whole or not at all; the rewriter lists what an
+unregistered build kept, and the NSP script reports it.
 """
 import ast
 import copy
@@ -176,11 +178,103 @@ class Matching(unittest.TestCase):
                     ('0100000000000001', 'main', 'ab' * 16, NOP)):
                 with self.subTest(game=gid, module=name, build=bid):
                     img = bytearray(self.original)
+                    out = root / 'out' / gid / name / bid; out.mkdir(parents=True)
                     ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib,
-                              d=bytes(0x40) + bytes.fromhex(bid), IMG=img, TEXT_END=0x2000, NAME=name)
+                              d=bytes(0x40) + bytes.fromhex(bid), IMG=img, TEXT_END=0x2000, NAME=name, outdir=str(out))
                     with patch.dict(os.environ, DM_GAME=gid, DM_GAMES_DIR='/derived/profile', DM_GAMES_FIRST='1'):
                         exec(code, ns)
                     self.assertEqual(struct.unpack_from('<I', img, 0x108)[0], expected)
+                    # an unregistered build with rules lists their results; a registered build and a module without rules write nothing
+                    tsv = out / f'{name}.match.tsv'
+                    self.assertEqual(tsv.is_file(), expected != MOV and bid == '00' * 16)
+                    if tsv.is_file(): self.assertEqual([l.split('\t')[:3] for l in tsv.read_text().splitlines()[1:]], [['patch', 'heap', '0x108']])
+
+    def test_registry_reports_what_an_unregistered_build_lost(self):
+        # the repository profile's build rows name the registered builds of the module, whose CUTS the unregistered build did not get
+        source = TOOLS / 'patch_nso.py'; tree = ast.parse(source.read_text())
+        start = next(i for i, n in enumerate(tree.body) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == 'PATCH_FILES')
+        end = next(i for i, n in enumerate(tree.body[start:], start) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == 'KEYS')
+        code = compile(ast.Module(body=tree.body[start:end], type_ignores=[]), str(source), 'exec')
+        gid, known = '0100000000000001', 'ab' * 16
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / 'tools').mkdir(); (root / 'tools/sdk_patches.py').write_text('')
+            g = root / 'games' / gid; g.mkdir(parents=True)
+            (g / 'patches.py').write_text("CUTS = {'" + known + "': [(0x108, 'e00317aa', '1f2003d5', 'a'), (0x10c, '1f2003d5', '1f2003d5', 'b')]}\n")
+            (g / 'game.tsv').write_text(f'build\tv65536\t1.0.1\tmain={known}\tsdk={"cd" * 16}\n')
+            img = bytearray(self.original)
+            ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib,
+                      d=bytes(0x40) + bytes(16), IMG=img, TEXT_END=0x2000, NAME='main', outdir=str(root / 'out'))
+            with patch.dict(os.environ, DM_GAME=gid): exec(code, ns)
+            self.assertEqual(bytes(img), bytes(self.original))
+            rows = [l.split('\t') for l in (root / 'out/main.match.tsv').read_text().splitlines()[1:]]
+            self.assertEqual(rows, [['registered', known, '1.0.1', '2']])
+
+
+class Patches(unittest.TestCase):
+    """A patch of several functions: one constant whose uses lie in different functions applies whole or not at all"""
+    def setUp(self):
+        self.original = image({0x100: caller(0x100, 0x500), 0x500: [0xd2800020, RET], 0x800: [MOV, NOP, RET]})
+        self.rule = Image(self.original, 0x2000).patch_recipe([(0x108, 'e00317aa', 'e0124091', 'size'), (0x800, 'e00317aa', 'e0124091', 'bound')], 'region')
+
+    def test_recipe_spans_functions(self):
+        self.assertEqual(set(self.rule), {'name', 'functions'})
+        self.assertEqual([(f['size'], [c[0] for c in f['cuts']]) for f in self.rule['functions']], [(28, [8]), (12, [0])])
+        one = Image(self.original, 0x2000).patch_recipe([(0x108, 'e00317aa', 'e0124091', 'size')], 'region')
+        self.assertEqual(set(one), {'name', 'size', 'fingerprints', 'cuts'})  # one function: the single form
+        self.assertEqual(one['cuts'], [(8, 'e00317aa', 'e0124091', 'size')])
+
+    def test_relocated_functions_match_together(self):
+        moved = image({0x900: caller(0x900, 0x1200), 0x1200: [0xd2800020, RET], 0x300: [MOV, NOP, RET]})
+        messages = []
+        self.assertEqual([c[0] for c in resolve(moved, 0x2000, [self.rule], messages.append)], [0x908, 0x300])
+        self.assertFalse([m for m in messages if m.startswith('[RED]')], messages)
+
+    def test_one_changed_function_applies_none(self):
+        changed = image({0x100: caller(0x100, 0x500), 0x500: [0xd2800020, RET], 0x800: [MOV, MOV, RET]})
+        before, messages, outcomes = bytes(changed), [], []
+        self.assertEqual(resolve(changed, 0x2000, [self.rule], messages.append, outcomes), [])
+        self.assertEqual(bytes(changed), before)
+        self.assertTrue(messages[0].startswith('[RED] ') and 'function 2 of 2' in messages[0] and 'the other 1 matched' in messages[0], messages)
+        self.assertEqual(outcomes[0][:2], ('region', None))
+
+    def test_alternative_implementations_of_a_patch(self):
+        # a later build changed the bound's function: a second implementation of the same patch, which shares the first function
+        later = image({0x100: caller(0x100, 0x500), 0x500: [0xd2800020, RET], 0x800: [NOP, MOV, NOP, RET]})
+        alt = Image(later, 0x2000).patch_recipe([(0x108, 'e00317aa', 'e0124091', 'size'), (0x804, 'e00317aa', 'e0124091', 'bound')], 'region')
+        for img, offs in ((self.original, [0x108, 0x800]), (later, [0x108, 0x804])):
+            with self.subTest(offs=offs):
+                outcomes = []
+                self.assertEqual([c[0] for c in resolve(img, 0x2000, [self.rule, alt], lambda _: None, outcomes)], offs)
+                self.assertEqual(outcomes[0][1], offs)
+
+    def test_two_functions_cannot_match_one(self):
+        rule = {'name': 'region', 'functions': [self.rule['functions'][1], dict(self.rule['functions'][1], cuts=[(4, '1f2003d5', '1f2003d5', 'again')])]}
+        with self.assertRaisesRegex(MatchError, 'another one did'): Image(self.original, 0x2000).match_patch(rule)
+
+    def test_malformed_patches_are_rejected(self):
+        f = self.rule['functions'][0]
+        for bad in ({'name': 'region', 'functions': [f]}, {'name': 'region', 'functions': [f, f], 'size': 4},
+                    {'name': 'region', 'functions': [f, dict(f, name='other')]}, {'name': 'region', 'functions': [f, dict(f, cuts=[])]}):
+            with self.assertRaises(ValueError): validate(bad)
+
+    def test_pack_report(self):
+        # the NSP script's summary of what modules of unregistered builds kept (report_fix_coverage)
+        import importlib.util as iu
+        repo = TOOLS.parents[1]
+        sys.path.insert(0, str(repo / 'dm/games'))
+        spec = iu.spec_from_file_location('build_ipa_from_nsp', repo / 'scripts/build_ipa_from_nsp.py'); assert spec and spec.loader
+        nsp = iu.module_from_spec(spec); spec.loader.exec_module(nsp)
+        reg = type('Reg', (), {'dir': Path('/repo/dm/games/0100000000000001')})()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'main.match.tsv').write_text('# main\nregistered\t' + 'ab' * 16 + '\t13.0.5\t11\n')
+            (out / 'sdk.match.tsv').write_text('# sdk\npatch\tnode area\t0x10,0x20\timplementation 1 of 1\npatch\tregion\t-\tfunction 1 of 4: 0 matching functions\n')
+            said = []
+            with patch.object(nsp, 'say', said.append): nsp.report_fix_coverage(out, ['main', 'sdk', 'subsdk0'], reg)
+        self.assertEqual(len(said), 3, said)
+        self.assertTrue(said[0].startswith('[RED] main: no function patch') and '13.0.5 (abababab…) has 11 cuts' in said[0], said[0])
+        self.assertTrue(said[1].startswith('[RED] sdk: function patches not applied') and "'region' (function 1 of 4" in said[1], said[1])
+        self.assertEqual(said[2], "sdk: function patches applied: 'node area'")
 
 
 if __name__ == '__main__': unittest.main()
