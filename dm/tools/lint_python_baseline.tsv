@@ -97,13 +97,11 @@ pyright	dm/tools/patch_nso.py	reportArgumentType	4	Argument of type "str | None"
 pyright	dm/tools/patch_nso.py	reportCallIssue	4	No overloads for "fullmatch" match the provided arguments
 pyright	dm/tools/patch_nso.py	reportIndexIssue	3	"__getitem__" method not defined on type "set[Unknown]"
 pyright	dm/tools/patch_nso.py	reportOptionalMemberAccess	1	"exec_module" is not a known attribute of "None"
-pyright	dm/tools/patch_nso.py	reportOptionalMemberAccess	1	"group" is not a known attribute of "None"
 pyright	dm/tools/patch_nso.py	reportOptionalMemberAccess	1	"groups" is not a known attribute of "None"
 pyright	dm/tools/patch_nso.py	reportOptionalMemberAccess	1	"loader" is not a known attribute of "None"
 pyright	dm/tools/patch_nso.py	reportOptionalMemberAccess	1	"op_str" is not a known attribute of "None"
 pyright	dm/tools/patch_nso.py	reportOptionalMemberAccess	1	"replace" is not a known attribute of "None"
 pyright	dm/tools/patch_nso.py	reportOptionalOperand	2	Operator "+" not supported for "None"
-pyright	dm/tools/patch_nso.py	reportOptionalOperand	2	Operator "<=" not supported for "None"
 pyright	dm/tools/patch_nso.py	reportOptionalSubscript	3	Object of type "None" is not subscriptable
 pyright	dm/tools/patch_nso.py	reportWildcardImportFromLibrary	1	Wildcard import from a library not allowed
 pyright	dm/tools/sdis.py	reportWildcardImportFromLibrary	1	Wildcard import from a library not allowed

@@ -112,6 +112,14 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** `capture` in `hle_audren.c` takes the layout whose walk finds the 0xcafebabe magic on every command of the first valid list; [incomplete startup lists](#incomplete-startup-lists-must-not-select-the-command-layout) leave detection open.
 - **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) (SDK 6.5.0).
 
+### Unaligned command headers during layout probing
+
+- **Symptom:** UBSan reports a misaligned `uint32_t` load in `cmd_ok` while `t_audren_layout` probes SDK 4/6 lists (issue #409).
+- **Cause:** interpreting the command ID as another layout's size can advance the candidate pointer off word alignment. Typed header loads then have undefined C behavior even though arm64 supports the machine load. A wrong size could also take the next header outside the generated list.
+- **Fix:** `cmd_size`, `cmd_id` and the magic check decode multibyte wire fields with `memcpy`. `cmd_ok` verifies that the complete header and command fit before consuming them; malformed-command diagnostics do not dereference a rejected header. All supported SDK layouts use the same readers, with no game gate.
+- **Check:** `t_audren_layout` checks deliberately unaligned headers, every truncated header/body length, invalid signed sizes and stereo PCM for SDK 4/6/16/21, including recovery from incomplete startup lists. The shipped SDK 6 processor reads the enabled byte at +0x10 before dispatching any command, confirming the 0x11-byte minimum used by the parser. Its UBSan alignment suppression was removed.
+- **Found on:** the sanitizer audit's SDK 4/6 fixtures, representing [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) and [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md); no game crash was attributed to this undefined load.
+
 ### SDK 8: command IDs numbered differently
 
 - **Symptom:** no music and no sound effects, only the movies' sound (the log repeats `audren: first-frame commands …` every frame and never prints `DeviceSink inputs`).
@@ -168,6 +176,14 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
   - `front_ios.m` also observes `AVAudioSessionMediaServicesWereResetNotification` (`dm_audio_reset` recreates every AudioUnit);
   - a watchdog in `hle_audio.c` switches any started output whose device has not called back for 200 ms in focus to the silent sink, retrying the AudioUnit after 1, 2, 4, 8 s. A start that fails (session still held by a call) falls back the same way instead of aborting.
 - **Check:** the log shows `audio session: interrupted`, `the device has not called back for N ms` and `AudioUnit restarted`. `tests/t_audio.c` (in `dm/host`) scenario 3 stops a playing AudioUnit behind the host's back.
+
+### AudioUnit construction before output publication
+
+- **Symptom:** TSan reports `au_create` writing `a->au` while `au_watchdog` reads it under `g_aos_lock` when a second real output opens (issue #410).
+- **Cause:** `au_open_at` put the output into the lifecycle/watchdog registry before joining its AudioUnit construction helper. The registry lock did not order the helper's writes.
+- **Fix:** construct and join while the output is private, then publish it under `g_aos_lock`. Suspend, resume, reset and watchdog readers only discover the completed output. Construction remains outside that lock because joining the helper can yield the guest core.
+- **Check:** `t_audio_device` asserts from inside AudioUnit creation that the pending output is absent from the registry; it failed before the fix. `t_audio` exercises real output lifetimes and watchdog recovery under TSan with the `au_create` suppression removed.
+- **Found on:** host unit tests; no particular game's failure was attributed to this race.
 
 ### Audio across a background round trip on the Mac
 

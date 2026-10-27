@@ -127,6 +127,8 @@ class Image:
                 if (c >> 10) & 0xfff == lo:
                     name = self._import_slots().get(page + lo)
                     if name: return ('import', name)
+            # The SDK's system call wrappers are assembly without unwind entries; `svc #n; ret` is identified by its call number
+            if a & 0xffe0001f == 0xd4000001 and b == 0xd65f03c0 and target not in self.functions: return ('svc', (a >> 5) & 0xffff)
         if target not in self.functions: raise MatchError(f'callee has no verified boundary or import at {target:#x}')
         return ('function', self.functions[target] - target, self._body(target)[0])
 
@@ -223,14 +225,15 @@ def validate(rule):
         if any(_pc_relative(w) for w, in struct.iter_unpack('<I', nb)): raise ValueError('replacement must not contain PC-relative instructions')
 
 
-def resolve(image, text_end, rules, report=print, outcomes=None):
-    """Return verified cuts without mutating the image; refuse missing/ambiguous rules. outcomes, a list, gets (patch name, cut offsets or None, why) for each patch"""
+def resolve(image, text_end, rules, report=print, outcomes=None, red=True):
+    """Return verified cuts without mutating the image; refuse missing/ambiguous rules. outcomes, a list, gets (patch name, cut offsets or None, why) for each patch.
+    red=False logs a patch that does not apply as a plain line (SDK-wide patches, which a module may not need)"""
     if not rules: return []
     groups = {}
     # Rules with the same name are one patch's reviewed implementations (code another build changed, with its own size or cut offsets): exactly one of them must match
     for rule in rules: groups.setdefault(rule['name'], []).append(rule)
     def missed(name, why):
-        report(f'[RED] function patch {name!r} skipped: {why}')
+        report(f'{"[RED] " if red else ""}function patch {name!r} skipped: {why}')
         if outcomes is not None: outcomes.append((name, None, why))
     try: module = Image(image, text_end)
     except MatchError as e:

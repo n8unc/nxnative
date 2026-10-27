@@ -253,8 +253,10 @@ static void *motion_sender(void *arg) {
     while (!atomic_load(&motion_go)) sched_yield();
     for (int i = 0; i < 100; i++) {
         dm_motion_set(p, (float[]){0, 0, -1}, (float[]){0, 0, 1});
+        dm_motion_set_hid(p, (float[]){0, 0, -1}, (float[]){0, 0, 1}, motion_now);
         if (!p) dm_motion_set_switch(0, (float[]){0, 0, -1}, (float[]){0, 0, 0});
         dm_motion_clear(p);
+        dm_motion_clear_hid(p);
     }
     return NULL;
 }
@@ -320,6 +322,38 @@ static void t_motion_live(void) {
     CHECK(st[0].acc[2] == -1 && h_hid_SixRest(&h), "co-op: player 2's motion stays on its own sensor");
     dm_motion_clear(1); dm_pad_players(1); g_phone_mode = -1;
 }
+static void t_motion_hid(void) {
+    g_mode = 1; dm_pad_players(3); ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); g_phone_mode = 0;
+    uint32_t h = 0; SixAxisState st;   // SixAxisSensorHandle uses the style bit index (FullKey = 0), unlike VibrationDeviceHandle's SDK style = 3.
+    float flat[3] = {0, 0, -1}, tilted[3] = {.5f, 0, -.8660254f}, turn[3] = {0, 0, 2 * (float)M_PI};
+    motion_now += 1000000000;
+    dm_motion_clear(0);
+    for (int i = 0; i < 3; i++) dm_motion_set_hid(0, flat, turn, motion_now - (2 - i) * 5000000);
+    h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == 0 && fabsf(st.angle[2] - .01f) < 1e-6f, "HID: batch integrates two 5 ms intervals, independently of GC arrival time");
+    dm_motion_set_hid(0, tilted, (float[]){0, 0, 0}, motion_now - 5000000);
+    dm_motion_set_hid(0, tilted, turn, motion_now + 1);
+    dm_motion_set_hid(0, tilted, turn, motion_now - MOTION_STALE_NS - 1);
+    h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == 0 && st.gyro[2] > .99f && fabsf(st.angle[2] - .01f) < 1e-6f, "HID: reordered, future and stale samples cannot rewind or replace the orientation");
+    motion_now += 1000000; dm_motion_set(0, tilted, turn);
+    h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == .5f && st.angle[2] == 0, "HID: usable GC motion takes over with its independent orientation");
+    dm_motion_clear(0); h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == 0 && fabsf(st.angle[2] - .01f) < 1e-6f, "HID: GC removal reveals raw source's independent orientation");
+    dm_motion_clear_hid(0); h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == 0 && st.acc[2] == -1 && st.angle[2] == 0, "HID: removing both controller sources returns to flat");
+    dm_motion_set_hid(0, flat, turn, motion_now); h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == 0 && st.angle[2] == 0, "HID: reconnect starts a new orientation");
+    motion_now += MOTION_STALE_NS + 1; dm_motion_set(0, tilted, turn); h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == .5f, "HID: stale raw stream yields to live GC motion");
+    dm_motion_set_hid(1, flat, turn, motion_now); h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == .5f, "HID: another player's raw data stays on its own sensor");
+    dm_motion_set_hid(0, flat, turn, motion_now); dm_motion_set_switch(0, (float[]){0, -1, 0}, (float[]){0, 0, 0}); g_phone_mode = 1;
+    h_hid_SixStates(&st, 1, &h); CHECK(st.acc[1] == -1, "HID: forced phone selection still wins");
+    dm_motion_clear_hid(0); dm_motion_clear_hid(1); dm_motion_clear(0); g_phone_motion.last_ns = 0;
+    dm_pad_players(1); g_phone_mode = -1;
+}
 
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
@@ -330,6 +364,7 @@ int main(void) {
     t_rumble_log();
     t_motion_threads();
     t_motion_live();
+    t_motion_hid();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

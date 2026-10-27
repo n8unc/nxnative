@@ -50,6 +50,41 @@ fragment main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuff
 
 
 class Regress(unittest.TestCase):
+    def test_impact_without_machine_paths(self):
+        env = {k: v for k, v in regress.os.environ.items() if k not in ('REGRESS_ROOT', 'REGRESS_GAMES')}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            command = [regress.sys.executable, REPO / 'scripts/regress.py']
+            result = regress.sh([*command, 'impact', 'HEAD..HEAD'], cwd=root, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('## regress.py impact', result.stdout)
+            self.assertEqual(list(root.iterdir()), [])   # an unset root must not become cwd/reports
+            out = root / 'explicit'
+            result = regress.sh([*command, 'impact', 'HEAD..HEAD', '--out', out], cwd=root, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((out / 'impact.json').read_text())['schema'], 'nxnative-impact/1')
+            self.assertTrue((out / 'impact.md').is_file())
+            harness = root / 'harness'; harness.mkdir()
+            result = regress.sh([*command, '--root', harness, 'impact', 'HEAD..HEAD'], cwd=root, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(list((harness / 'reports').glob('*/impact.json'))), 1)
+
+    def test_game_commands_require_machine_paths(self):
+        env = dict(regress.os.environ, REGRESS_ROOT='', REGRESS_GAMES='')
+        with tempfile.TemporaryDirectory() as td:
+            command = [regress.sys.executable, REPO / 'scripts/regress.py']
+            for cmd in ('baseline', 'check', 'chain', 'usage', 'list'):
+                with self.subTest(cmd=cmd):
+                    result = regress.sh([*command, cmd], cwd=td, env=env)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn('set --root (REGRESS_ROOT) and --games-dir (REGRESS_GAMES)', result.stderr)
+            for option, missing in (('--root', '--games-dir (REGRESS_GAMES)'), ('--games-dir', '--root (REGRESS_ROOT)')):
+                with self.subTest(option=option):
+                    result = regress.sh([*command, option, td, 'check'], cwd=td, env=env)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn('set ' + missing + ':', result.stderr)
+            self.assertEqual(list(Path(td).iterdir()), [])
+
     def test_interface(self):
         vo, fi = regress.msl_io(VS, 'main0_z', 'vs'), regress.msl_io(PS, 'main0', 'ps')
         self.assertEqual(vo, {'locn0': 'float4', 'locn2': 'float4'})
@@ -65,8 +100,20 @@ class Regress(unittest.TestCase):
     def test_routes(self):   # every profile's smoke.tsv reads
         for f in (REPO / 'dm/games').glob('*/smoke.tsv'):
             r = regress.read_route(f)
-            self.assertTrue(r['secs'] > 0 and r['quick'] > 0 and r['keys'], f)
+            self.assertTrue(r['secs'] > 0 and r['quick'] > 0, f)
+            self.assertIsInstance(r['keys'], str, f)   # title-screen routes need no input
             if r['reach']: self.assertTrue(r['reach'][1] <= r['secs'], f)
+
+    def test_route_keys_are_optional_and_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / 'smoke.tsv'
+            for row, keys in (('', ''), ('keys\t\n', ''), ('keys\t1:A,2:B\n', '1:A,2:B')):
+                with self.subTest(row=row):
+                    f.write_text('save\tnew\nsecs\t40\nquick\t35\nreach\t1200@30\n' + row)
+                    r = regress.read_route(f)
+                    self.assertEqual(r['keys'], keys)
+                    self.assertEqual(r['save'], 'new')
+                    self.assertEqual(r['reach'], (1200, 30.0))
 
     def test_chain_diff(self):
         b = {'shaders': {'a': {'st': 'ok', 'msl': '1'}, 'b': {'st': 'ok', 'msl': '2'}, 'c': {'st': 'metal failed'}, 'd': {'st': 'ok', 'msl': '4'}},

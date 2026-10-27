@@ -324,8 +324,9 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Every history entry is the newest sample, numbered by time. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
 // DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
-typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, logged; } live_motion;
+typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
+static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
 static pthread_once_t g_motion_once = PTHREAD_ONCE_INIT;
 static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode;
@@ -337,34 +338,42 @@ static void motion_env(void) {
     g_motion_log = (e = getenv("DM_MOTION_LOG")) && atoi(e);
     e = getenv("DM_PHONE_MOTION"); g_phone_mode = !e || !strcmp(e, "auto") ? -1 : !!atoi(e);
 }
-static void motion_set(int p, const float acc[3], const float rot[3], int switch_frame) {
-    if (p < 0 || p >= DM_PLAYERS || (switch_frame && p)) return;
+static void motion_set(int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
+    if (p < 0 || p >= DM_PLAYERS || (source == 1 && p)) return;
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return;
     static motion_map identity = {{0, 1, 2}, {1, 1, 1}, 1, 1};
-    // The phone and a controller have different body frames and clocks: never integrate their interleaved samples into one orientation.
-    live_motion *m = switch_frame ? &g_phone_motion : &g_motion[p]; uint64_t t = now_ns();
+    // Each transport owns its orientation. HID batches carry three sample times; arrival time controls freshness, never their integration intervals.
+    live_motion *m = source == 1 ? &g_phone_motion : source == 2 ? &g_hid_motion[p] : &g_motion[p];
+    uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
+    if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
-    if (!m->last_ns || t - m->last_ns > MOTION_STALE_NS) motion_reset(&m->st);
+    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; }
+    if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
-    motion_update(&m->st, switch_frame ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
+    motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
         LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
-            switch_frame ? "phone" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
+            source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
-    m->last_ns = t;
+    m->last_ns = t; m->received_ns = now;
     pthread_mutex_unlock(&m->mu);
 }
-void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0); }
-void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 1); }
+void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0, 0); }
+void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 1, 0); }
+void dm_motion_set_hid(int p, const float acc[3], const float rot[3], uint64_t t) { if (t) motion_set(p, acc, rot, 2, t); }
 void dm_motion_clear(int p) {
     if (p < 0 || p >= DM_PLAYERS) return;
     pthread_mutex_lock(&g_motion[p].mu); g_motion[p].last_ns = 0; pthread_mutex_unlock(&g_motion[p].mu);
 }
+void dm_motion_clear_hid(int p) {
+    if (p < 0 || p >= DM_PLAYERS) return;
+    pthread_mutex_lock(&g_hid_motion[p].mu); g_hid_motion[p].last_ns = 0; pthread_mutex_unlock(&g_hid_motion[p].mu);
+}
 static uint64_t motion_copy(live_motion *m, motion_state *out) {   // copies a source while it is fresh; returns its timestamp
     uint64_t t;
     pthread_mutex_lock(&m->mu);
-    t = m->last_ns && now_ns() - m->last_ns <= MOTION_STALE_NS ? m->last_ns : 0;
+    t = m->last_ns && now_ns() - m->received_ns <= MOTION_STALE_NS ? m->last_ns : 0;
     if (t) *out = m->st;
     pthread_mutex_unlock(&m->mu);
     return t;
@@ -377,6 +386,7 @@ static int motion_live(int p, motion_state *out) {
     uint32_t src = p ? 1u << p : 1u | merged_players(); uint64_t newest = 0;
     for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) {
         motion_state st; uint64_t t = motion_copy(&g_motion[i], &st);
+        if (!t) t = motion_copy(&g_hid_motion[i], &st);
         if (t > newest) { newest = t; *out = st; }
     }
     if (newest) return 1;
