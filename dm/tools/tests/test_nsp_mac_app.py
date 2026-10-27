@@ -92,7 +92,7 @@ class PackReuse(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix='pack-reuse-', dir=TEST_ROOT)).resolve()
         self.addCleanup(shutil.rmtree, self.tmp)
         t = self.tmp
-        for d in ('patched', 'romfs/empty', 'msl', 'profile', 'font', 'aoc/1', 'pso', 'bin', 'sdk', 'source'):
+        for d in ('patched', 'romfs/empty', 'msl', 'profile', 'font', 'aoc/1', 'pso', 'bin', 'sdk', 'source', 'host', 'tools'):
             (t / d).mkdir(parents=True)
         files = {
             'dmhost': b'host', 'patched/main.patched.bin': b'code', 'patched/main.fixups.tsv': b'fixups',
@@ -101,6 +101,7 @@ class PackReuse(unittest.TestCase):
             'font/nintendo_ext.ttf': b'font', 'aoc/1/data': b'dlc', 'pso/gpu.mtl4a': b'archive',
             'pso/prebuilt.tsv': b'prebuilt', 'pso/rest_pairs.tsv': b'rest', 'pso/archive.tsv': b'index',
             'env.txt': b'DM_TEST=1', 'split.tsv': b'split', 'icon.jpg': b'jpeg', 'source/launcher.c': b'launcher',
+            'host/romfs_image.h': b'validator', 'tools/romfs.py': b'reader',
         }
         for n in pack_app.TABLES: files['profile/' + n] = n.encode()
         for n, content in files.items(): (t / n).write_bytes(content)
@@ -194,6 +195,17 @@ class PackReuse(unittest.TestCase):
                 p.with_name('added').write_bytes(b'new'); self.assert_repacked()
                 p.with_name('added').rename(p.with_name('renamed')); self.assert_repacked()
         (self.tmp / 'romfs/new-empty').mkdir(); self.assert_repacked()
+
+    def test_image_is_copied_once_and_its_changes_invalidate_reuse(self):
+        import romfs_image
+        source = self.tmp / 'romfs'; image = self.tmp / 'RomFS.img'
+        romfs_image.pack(source, image); self.args.romfs = str(image)
+        self.pack(); self.assert_reused()
+        resources = Path(self.args.out) / 'Contents/Resources'
+        self.assertEqual((resources / 'romfs.img').read_bytes(), image.read_bytes())
+        self.assertFalse((resources / 'romfs').exists())
+        (source / 'marker').write_text('new bytes'); romfs_image.pack(source, image)
+        self.assert_repacked()
 
     def test_all_metadata_sign_identity_and_selected_paths_invalidate(self):
         self.pack()

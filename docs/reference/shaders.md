@@ -4,6 +4,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ## Containers by engine
 
+### A file no reader reads
+
+- **Symptom:** the shader split stops on one archive with a Python traceback (an `IndexError` or `struct.error` naming no file), or a reader's `[RED]` line about a format it does not know, and nothing is written; the NSP script loses the build at the split.
+- **Cause:** a worker's exception (and `red()`, a `SystemExit`) ended the whole split through the process pool, so one archive of a format revision a reader does not know stopped every other file's shaders too. `nlg_dict` read its index without checking the layout, so an index of another revision gave an `IndexError` instead of a line naming the archive.
+- **Fix:** `scan_file` leaves out a file whose reader fails, with `[RED] <file>: <why> (its shaders are left out)`, and the split goes on; at the end it prints `[RED] <n> file(s) could not be read, their shaders are left out (first: …)` and writes its tables. The NSP script shows that line and packs a provisional profile's IPA without those shaders; for a registered profile it stops there, since the profile's tables were split from every file. `nlg_dict` checks that the records and chunks fit the index and every chunk index is in range before reading it. The format itself still needs a reader: the line names the archive and, for NLG, its header bytes.
+- **Found on:** Mario Strikers: Battle League (no profile; [seedds/nxnative#282](https://github.com/seedds/nxnative/pull/282)): one of its 879 Next Level Games archives, a revision `nlg_dict` does not read.
+
 ### BNSH in NintendoWare archives and in main
 
 - BNSH (`BNSH\0\0\0\0` + `grsc` block at +0x60) is found inside `bfsha`, particle effects (`esetb`, VFXB), UI layouts (`blarc`), and `main` itself.

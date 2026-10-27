@@ -175,8 +175,8 @@ class Game:
         self.derived = (build / 'profile' / self.id / 'game.tsv').is_file()
 
     def romfs(self):
-        r = self.build / 'extract' / self.ver / 'RomFS'
-        return r if r.is_dir() else bench.newest(self.build.glob('extract/v*')) / 'RomFS'
+        r = bench.rfs.source(self.build / 'extract' / self.ver)
+        return r if r.is_dir() else bench.rfs.source(bench.newest(self.build.glob('extract/v*')))
 
     def route(self):
         f = REPO / 'dm/games' / self.id / 'smoke.tsv'
