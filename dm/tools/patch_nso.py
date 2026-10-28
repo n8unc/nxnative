@@ -14,43 +14,30 @@
 # Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv
 import struct, re, sys, os, glob, types, importlib.util
 from itertools import combinations
-import lz4.block
 from capstone import *
 from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
-import nso_asm
+import nso, nso_asm
 from nso_asm import *   # the instruction encoders (B, ADRP, LDRX, ...), shared with the per-build patch files
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
-d = open(src, 'rb').read()
-if d[0x10:0x14] == b'NRO0':
-    # An NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code): the file is the image itself, each segment stored at its memory offset
-    # and uncompressed; +0x20 text, +0x28 ro, +0x30 data as {offset, size}, +0x38 bss size, +0x40 the build ID. Rewritten as an NSO of the same layout would be
-    flags, csz = 0, [struct.unpack_from('<II', d, 0x20 + 8 * i)[1] for i in range(3)]
-    segs = [(o, o, sz) for o, sz in (struct.unpack_from('<II', d, 0x20 + 8 * i) for i in range(3))]
-    bss = struct.unpack_from('<I', d, 0x38)[0]
-else:
-    assert d[:4] == b'NSO0'
-    flags = struct.unpack_from('<I', d, 0xc)[0]
-    segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
-    bss = struct.unpack_from('<I', d, 0x3c)[0]
-    csz = struct.unpack_from('<III', d, 0x60)
+# An NSO, or an NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code), rewritten as an NSO of the same layout would be. nso.py checks the file
+# against its header before anything is allocated (a damaged module stops here with a [RED] line)
+MOD = nso.cli_read(src)
+bss = MOD.bss
 # Every jump between the patch area and the code is a B (±128 MB). A patch area appended after the image (with bss) cannot reach the code when it would start beyond 112 MB (leaving 16 MB for the patch area): Metroid Dread's main has about 1.8 GB of bss (the engine's static heap); Engage's main starts its patch area at about 103 MB and keeps it after the image.
 # The patch area then sits FRONT bytes before the module base (PATCH_OFF is negative), and the output file holds only text + ro + data (FILE_IMAGE_LEN) followed by the patch area; the loader supplies zero pages for bss and the key page (IMAGE_SIZE is the whole image).
 # The key page stays after bss (the patch area reaches it through ADRP, ±4 GB). Modules below the limit produce output byte-identical to before
-NEAR_PATCH_OFF = ((((segs[2][1] + segs[2][2] + bss + 0x3FFF) & ~0x3FFF) + 0x4000 + 0xFFFF) & ~0xFFFF)   # where an appended patch area would start (as in the else branch below)
+NEAR_PATCH_OFF = ((((len(MOD.image) + bss + 0x3FFF) & ~0x3FFF) + 0x4000 + 0xFFFF) & ~0xFFFF)   # where an appended patch area would start (as in the else branch below)
 FAR, FRONT = NEAR_PATCH_OFF > 0x7000000, 0x2000000
 # A text segment that ends within 32 MB of the ±128 MB reach (Monster Hunter Rise: 125.3 MB of text) puts the patch area right before the base instead. Its stubs follow the sites in address
 # order, so the last site's stub ends up about as far from it as the text is long. The first pass tries the gap that keeps every site in reach; when the patch area does not fit there
 # (Monster Hunter Rise: 3.6 MB), the rewriter runs again with exactly the size it needs (DM_PATCH_FRONT, set only by that rerun) and B() checks every branch
-BIG_TEXT = FAR and segs[0][2] + FRONT > 0x8000000 - 0x10000
-if BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - segs[0][2]) & ~0xFFFF
-IMG = bytearray(segs[2][1] + segs[2][2] + (0 if FAR else bss))
-for i, (fo, mo, sz) in enumerate(segs):
-    raw = d[fo:fo + csz[i]]
-    if flags >> i & 1: raw = lz4.block.decompress(raw, uncompressed_size=sz)
-    IMG[mo:mo + sz] = raw
-TEXT_END = segs[0][2]
-RO_OFF, DATA_OFF = segs[1][1], segs[2][1]
+BIG_TEXT = FAR and MOD.text_end + FRONT > 0x8000000 - 0x10000
+if BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - MOD.text_end) & ~0xFFFF
+IMG = MOD.image
+if not FAR: IMG.extend(bytes(bss))
+TEXT_END = MOD.text_end
+RO_OFF, DATA_OFF = MOD.segments[1][0], MOD.segments[2][0]
 if FAR:
     FILE_IMAGE_LEN = (len(IMG) + 0x3FFF) & ~0x3FFF
     KEY_PAGE_OFF = (len(IMG) + bss + 0x3FFF) & ~0x3FFF
@@ -74,6 +61,8 @@ else:
 #   sdk_patches.py's MATCH_CUTS are SDK-wide: every game's module of that name, when its build has no CUTS and the selected game's profile was not brought up on it (its build
 #     rows), so the games' registered builds rewrite as before. They are fixes of Nintendo's code that hold for any game on a platform with a small address space; a build
 #     without a reviewed implementation of one keeps the original code, logged but not red (games without virtual address memory never reach it)
+#   CAPABILITIES = {build ID: (name,...)}: verified main-build features exposed by fixups metadata to the launcher
+#   GENERALIZE = 'note': not read here; whether a general rule could replace the file's patches, listed by dm/tools/docs_patches.py in docs/agents/game-patches.md
 PATCH_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sdk_patches.py')] + sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games/*/patches.py')))
 # Profiles outside the repository (DM_GAMES_DIR, folders separated by os.pathsep, which is ':' as in dm/games/game.py: the NSP script's provisional profile of a game being brought up) may have a
 # patches.py of their own builds too; they are loaded after the repository's, under the same rule (a build ID claimed twice stops the rewrite)
@@ -82,7 +71,7 @@ patch_paths = {}
 for path in PATCH_FILES: patch_paths.setdefault(os.path.realpath(path), path)   # repeated roots and symlinks name the same file, not competing build claims
 PATCH_FILES = list(patch_paths.values())
 def load_patches():
-    tables, where = {'CUTS': {}, 'OBS': {}, 'FRAME_STEP': {}, 'MATCH_CUTS': {}, 'SDK_MATCH_CUTS': {}}, {}
+    tables, where = {'CUTS': {}, 'OBS': {}, 'FRAME_STEP': {}, 'MATCH_CUTS': {}, 'SDK_MATCH_CUTS': {}, 'CAPABILITIES': {}}, {}
     for n, path in enumerate(PATCH_FILES):
         spec = importlib.util.spec_from_file_location(f'patches_{n}', path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
         for kind, table in tables.items():
@@ -102,7 +91,7 @@ def load_patches():
                 table[bid], where[kind, bid] = v, path
     return tables, where
 PATCHES, PATCH_WHERE = load_patches()
-BUILD_ID = d[0x40:0x50].hex()
+BUILD_ID = MOD.build_id[:0x10].hex()
 cuts = list(PATCHES['CUTS'].get(BUILD_ID, []))
 if BUILD_ID not in PATCHES['CUTS']:
     from nso_match import resolve
@@ -555,7 +544,8 @@ done = set(); windows = []; jumps = {}; tabjumps = {}; tailcalls = set(); retrie
 def check_before_copy(insl, ctx, ld, idx):
     """The index copied from the checked register before the check, far back (DRAGON QUEST XI S main+0x2dd8cd0: mov w0,w18, then 41 instructions with two other jump tables on x0, then
     cmp w18,#4; b.hi; ldrsw x18,[x11,x0,lsl #2]; add x18,x18,x11; br x18). Accepted when the cmp and its b.hi come right before the load and the mov is the last writer of the index and of the
-    checked register before them (64 instructions back at most). The compiler checks one register and indexes with the other only when it knows they are equal; blocks in between that branch out
+    checked register before them. Kingdom Battle's GLSLC (subsdk0+0x7340b8) copies w17 into w18 71 instructions before the load, across two switches that preserve both registers: an arbitrary
+    64-instruction limit missed that copy. Follow the writers to the function's start, stopping at calls that can clobber either register or at gaps in decoded code. Blocks in between that branch out
     and back (main+0x2dd8ce0 → main+0x2dd8cb8) write neither. Tried only when every other form has failed (jump_offsets copy_first), so sites that rewrote before come out the same:
     the one br x18 of its kind among the 25,508 x18 sites of that main. → the cmp, or None"""
     k = ctx.index(ld)
@@ -565,8 +555,10 @@ def check_before_copy(insl, ctx, ld, idx):
     src, kl = m.group(1), insl.index(ld)
     def writes(p):   # capstone lists a compare's first operand as written (cmp w18,#4 at main+0x2dd8c30); it only sets the flags
         return set() if p.mnemonic in ('cmp', 'cmn', 'tst') else {'w' + p.reg_name(r)[1:] for r in p.regs_access()[1]}
-    for q in range(kl - 3, max(0, kl - 64) - 1, -1):
+    for q in range(kl - 3, -1, -1):
         p = insl[q]
+        if p.address + 4 != insl[q + 1].address: return None
+        if p.mnemonic in ('bl', 'blr') and any(int(r[1:]) <= 18 for r in idx | {src}): return None
         mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
         if mm and mm.group(1) in idx and mm.group(2) == src: break
         if writes(p) & (idx | {src}): return None
@@ -1479,13 +1471,17 @@ else:
     open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
 import hashlib
 with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:   # the same for every module: the rewriter and every patch file, by path from dm/tools
-    for src_ in (os.path.abspath(__file__), nso_code.__file__, nso_asm.__file__, *PATCH_FILES): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
+    for src_ in (os.path.abspath(__file__), nso.__file__, nso_code.__file__, nso_asm.__file__, *PATCH_FILES): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
 with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
     if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps there
     if RENDER_SCALE: f.write('# RENDER_SCALE\t1\n')   # a render-scale stub reads state +0x10 (the loader ignores the key; dm/games/settings.py offers the setting by it)
+    if NAME == 'main':
+        for capability in PATCHES['CAPABILITIES'].get(BUILD_ID, ()):
+            assert re.fullmatch(r'[A-Z][A-Z0-9_]*', capability), f'invalid capability {capability}'
+            f.write(f'# {capability}\t1\n')
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')   # the host identifies the build by it: features with hard-coded addresses only run on the build they belong to
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')

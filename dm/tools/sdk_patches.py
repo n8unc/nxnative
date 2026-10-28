@@ -1,6 +1,16 @@
 # The rewriter's patches of Nintendo SDK module builds (sdk), which several games can ship: dm/tools/patch_nso.py applies those of a module's NSO build ID, whatever the game.
 # A patch of a game's own module (main) goes in its profile's patches.py (dm/games/<id>/patches.py). CUTS as described in patch_nso.py ("Registered patches")
 CUTS = {
+  # Kingdom Battle 1.9.589692, SDK 4.4.0: the older VammManager reserves a
+  # full 1 GB node area (constructor +0x93dd8, occupied range +0x93e98).
+  # Snowdrop's compact 3 GB region follows its small metadata reservation;
+  # 1 GB placement alignment still cannot fit it in the iPhone guest block.
+  # Platform-limit cuts: 64 MB node area and 32 MB large-region alignment.
+  '9de92bad67c4150268943ab4843ace65': [
+    (0x93dfc, 'e9030232', '0980a052', 'VammManager node area limit: 1 GB to 64 MB'),
+    (0x93e8c, 'ea030232', '0a80a052', 'VammManager occupied node area: 1 GB to 64 MB'),
+    (0x93fe0, 'ea030232', '0a40a052', 'AllocateAddressRegion: align regions of 1 GB and more to 32 MB'),
+  ],
   # Xenoblade Chronicles 3 2.2.1, SDK 12.3.9: the same AddressRegionManager
   # constructor and size-class alignment as Engage's SDK 12.3.7. Its cut 4 GB
   # malloc reservation must fit the 4.375 GB alias region on iOS.
@@ -8,6 +18,15 @@ CUTS = {
     (0x346430, '08fca752', '087ca052', 'AddressRegionManager node area limit: 1 GB to 62 MB'),
     (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager occupied node area: 1 GB to 62 MB'),
     (0x34662c, '0a00a852', '0a40a052', 'AllocateAddressRegion: align regions of 1 GB and more to 32 MB'),
+  ],
+  # Pokémon Legends: Arceus 1.1.1 (SDK 11.4.0, Kirby and the Forgotten Land's sdk build): nninitStartup (main+0x2779d8c) initializes StandardAllocator over 32 GB with virtual address memory;
+  # the host's cap gives it 4.06 GB, which fits the 4.375 GB alias region only after a 62 MB node area and with 32 MB alignment (the region placement at sdk+0x34e1d8 aligns regions
+  # of 1 GB and more to 1 GB; without it, Break at sdk+0x39fb54). The SDK-wide rules' cuts (node area implementation 3, alignment implementation 2), registered because both profiles
+  # were brought up on this build; Kirby has no virtual address memory and never reaches them
+  'b39add63421be525d352e576dab438d3': [
+    (0x34e048, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x34e0e4, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0x34e244, '0a00a852', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
   ],
   # Pokemon Brilliant Diamond 1.3.0 (SDK 11.4.3): nninitStartup (main+0x2c1d5c) gives pool - used to StandardAllocator with virtual address memory.
   # Its first CentralHeap::Init aborts at sdk+0x2f98e4: the 1 GB node area leaves no room for the 1 GB-aligned 3.14 GB reservation in a 4.375 GB alias region.
@@ -123,7 +142,7 @@ CUTS = {
     (0x13be4c, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x13bee0, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
-  # Absolum 1.1.1 (v393216) sdk (SDK 18.3.2; the AddressRegionManager at the offsets of Galaxy's SDK 18.3.5 build): the same node area cut, and regions of 1 GB and more aligned to 32 MB
+  # Absolum's sdk (SDK 18.3.2, the same build in 1.1.1 v393216 and 1.1.2 v458752; the AddressRegionManager at the offsets of Galaxy's SDK 18.3.5 build): the same node area cut, and regions of 1 GB and more aligned to 32 MB
   # instead of 1 GB. VammManager::AllocateAddressRegion (sdk+0x13bfd0) aligns a region by its size: 64 KB under 2 MB, 2 MB under 4 MB, 4 MB under 32 MB, 32 MB under 1 GB, else 1 GB
   # (+0x13c03c), and places it first-fit after the regions already there. Absolum's two large regions (main's malloc, and the .NET GC's region range from the game_env) are both over 1 GB, with a 4 KB
   # region between them, so the alignment lost up to 1 GB before each one (measured with a 64 GB alias region: 0.6 GB before malloc's at that run's alias base, 1 GB before the GC's), which
@@ -244,6 +263,9 @@ MATCH_CUTS = {'sdk': [
     node(244, ['b02f0514e2cc25a65261ec23cefa9a1fe7b244b3db741f183deb334935541eee'], 0x10, '08fca752', '087ca052', 0x7c, '09fca752', '097ca052'),
     # SDK 7.3.2 (DRAGON QUEST XI S), 8.2.1 (Super Smash Bros. Ultimate), 10.4.1 (Advance Wars 1+2), 10.4.8 (Pikmin 4)
     align(352, ['006abd214d94c93386735550cee4fe7708bc1f0d1812663123cfa3b9611f1533', '42167e4d3c710e11937e45a9e420fdd0ed9a410386c17da4d1d896b847d3b0d6'], 0x6c, 'ea030232'),
+    # SDK 11.4.0 (Pokémon Legends: Arceus, Kirby and the Forgotten Land): the next rule's size classes with 8 more bytes of body; the 4 GB StandardAllocator region of Arceus's nninitStartup
+    # (the host's cap) fits after the 62 MB node area only with it
+    align(360, ['b8c0853dcad6b42ca2d504945c9944dd913a991297499e700a97a85bcf5a77c2'], 0x6c, '0a00a852'),
     # SDK 12.3.9 (Xenoblade Chronicles 3), 13.3.5 (Mario + Rabbids Sparks of Hope), 15.3.2 (Paper Mario: The Thousand-Year Door)
     align(352, ['4bec18d9a1f8c73408e95b54d971b2ae87ccb5451b185e3378c05801ad03fa39', '57ad718ebd4e8ebf49a3199c62e1ba2002867df5d124cfee6b4d30aeffee0b8d'], 0x6c, '0a00a852'),
     # SDK 16.2.0 (Sea of Stars), 18.3.2 (Absolum)

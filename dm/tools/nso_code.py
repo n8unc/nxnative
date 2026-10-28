@@ -110,15 +110,10 @@ if __name__ == '__main__':
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
     p = sys.argv[1]; raw = open(p, 'rb').read()
     if raw[:4] == b'NSO0':
-        import lz4.block
-        flags = struct.unpack_from('<I', raw, 0xc)[0]
-        segs = [struct.unpack_from('<III', raw, 0x10 + i * 0x10) for i in range(3)]
-        csz = struct.unpack_from('<III', raw, 0x60)
-        img = bytearray(segs[2][1] + segs[2][2])
-        for i, (fo, mo, sz) in enumerate(segs):
-            seg = raw[fo:fo + csz[i]]
-            img[mo:mo + sz] = lz4.block.decompress(seg, uncompressed_size=sz) if flags >> i & 1 else seg
-        text_end = segs[0][2]
+        import nso
+        try: m = nso.load(raw, p)
+        except nso.Error as e: sys.exit(f'[RED] {e}')
+        img, text_end = m.image, m.text_end
     else:
         img = raw; text_end = int(sys.argv[2], 0)
     blocks = data_blocks(img, text_end, Cs(CS_ARCH_ARM64, CS_MODE_ARM))
