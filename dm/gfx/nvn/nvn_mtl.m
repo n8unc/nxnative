@@ -4435,7 +4435,9 @@ static void prog_resolve(void) {
     S.prog = np; g_pso_dirty = 1;
     static unsigned n; if (!n++ || !(n & (n - 1))) MLOG("combined program taken again after a state restore: its ring slot had been reused (%u times so far)", n);
 }
+static int g_state_inited;
 static void state_reset(void) {
+    g_state_inited = 1;
     memset(&S, 0, sizeof S);
     g_pso_dirty = g_dss_dirty = 1;
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
@@ -4443,6 +4445,32 @@ static void state_reset(void) {
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
     S.ds = (ds_st){0, 1, NVN_DEPTH_FUNC_LESS, 0, NVN_STENCIL_FUNC_ALWAYS, NVN_STENCIL_FUNC_ALWAYS, 1, 1, 1, 1, 1, 1};
     S.st_vmask[0] = S.st_vmask[1] = S.st_wmask[0] = S.st_wmask[1] = 0xff; S.dr[1] = 1;
+}
+
+// GPU bindings belong to a queue, including across submissions. FFX/X-2 destroys its launcher's queue before creating a game's: a global S kept freed launcher programs in S.bst,
+// and X-2's first fragment-only bind dereferenced that stale vertex program in keys_hash. Separate queues also retain their own bindings when submissions alternate (Three Houses).
+typedef struct queue_state { uint64_t serial; typeof(S) s; typeof(R) r; struct queue_state *next; } queue_state;
+static queue_state *g_queue_states, *g_active_queue;
+void mtl_queue_activate(uint64_t serial) {   // caller holds the submission lock
+    if (g_active_queue && g_active_queue->serial == serial) return;
+    if (g_active_queue) { g_active_queue->s = S; g_active_queue->r = R; }
+    queue_state *q = g_queue_states;
+    while (q && q->serial != serial) q = q->next;
+    if (q) { S = q->s; R = q->r; prog_resolve(); }
+    else {
+        q = calloc(1, sizeof *q); if (!q) MDIE("queue state allocation failed");
+        q->serial = serial; q->next = g_queue_states; g_queue_states = q;
+        state_reset(); memset(&R, 0, sizeof R);
+    }
+    g_active_queue = q; g_pso_dirty = g_dss_dirty = 1; args_dirty_all();
+}
+void mtl_queue_forget(uint64_t serial) {   // caller holds the submission lock
+    queue_state **p = &g_queue_states;
+    while (*p && (*p)->serial != serial) p = &(*p)->next;
+    if (!*p) return;
+    queue_state *q = *p; *p = q->next;
+    if (g_active_queue == q) { g_active_queue = NULL; state_reset(); memset(&R, 0, sizeof R); args_dirty_all(); }
+    free(q);
 }
 
 // Correct the vertex format by the shader input's component type: Metal requires integer inputs to get integer formats of the same signedness, and float inputs float / normalized formats.
@@ -9672,7 +9700,7 @@ static void clear_ds_tri(const p_clear_ds *c) {
 }
 
 void mtl_exec(const uint8_t *p) {
-    static int inited; if (!inited) { inited = 1; state_reset(); }
+    if (!g_state_inited) state_reset();
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     int trace = dump_all && passdump();   // Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames
     for (;;) {

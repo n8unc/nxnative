@@ -1350,6 +1350,22 @@ def adrp_targets(d, lo, hi):
                 break
     return out
 
+def phyre_shaders(d, label):
+    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2)."""
+    out = []
+    for m in re.finditer(re.escape(CTL_MAGIC), d):
+        c = m.start()
+        if c + 0x708 > len(d): continue
+        cn = struct.unpack_from('<I', d, c + 0x20)[0]
+        kn = struct.unpack_from('<I', d, c + 0x704)[0]
+        k = c - kn
+        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d) or d[k:k + 4] != GFX_MAGIC: continue
+        ctl, code = d[c:c + cn], d[k:c]
+        st = sph_stage(code)
+        if st and not check(label, st, ctl, code): out.append((f'{label}#PHYRE@{k:#x}', st, ctl, code))
+    return out
+
+
 def raw_shaders(d, label, known=()):
     """Control sections in main that are in no GLSLC output and no BNSH file: a shader compiled offline whose control section and code area the code hands to nvnShaderData itself (Advance Wars 1+2:
     Re-Boot Camp, Unity 2020.2 with Bink 2: the movie player's 32: 2 vertex, 22 pixel and 8 compute shaders; without them its movies drew white). Most are 0x20-byte records in data {code area
@@ -1999,7 +2015,7 @@ def pixel_input_cover(shaders):
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
     return cover
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; and YEBIS's effect file (tfxo_shaders)
@@ -2122,7 +2138,18 @@ def scan_file_in(args):
     if head[:8] == GFPAK:   # a Game Freak archive (gfpak_members): each entry scanned as a file of its own (the shaders are BNSH entries)
         for nm, m in gfpak_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}{nm}', found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == b'SRYK':
+        import vbf
+        with open(path, 'rb') as f:
+            for entry in vbf.entries(path):
+                # Compiled effects and loose GPU programs; texture and sound members carry no shader programs.
+                if '.fx' in entry[0] or '/shaders/' in entry[0] or entry[0].endswith(('.vs.bin', '.ps.bin', '.fs.bin')):
+                    found += phyre_shaders(vbf.read(f, entry), f'/{rel}/{entry[0]}')
+        return rel, uniq_keys(found), var_pairs(found), trees
     d = unzs(path) if head[:4] == ZSTD_MAGIC else open(path, 'rb').read()   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
+    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC:
+        found += phyre_shaders(d, '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] != ZSTD_MAGIC and head[4:8] in (ZSTD_MAGIC, LZ4_FRAME_MAGIC): d = unsized(d, '/' + rel)   # HAL's .cmp containers (Kirby and the Forgotten Land: 7,201 of them, 5,121 zstd frames with 19,364 BNSH inside and 2,080 LZ4 frames). Read raw, the split found 121 shaders and the game asked for 900 it did not have ("[RED] shader ... is not in the shader map")
     if d[:4] == b'Yaz0': d = yaz0(d)
     if d[:3] == b'XNB' and d[4] == 5 and d[5] & 0xC0 and len(d) > 14:   # a compressed XNB (Stardew Valley: 3,535 LZ4 files, 8 LZX): only effects (EffectReader) carry MGFX shaders, and for LZX the reader names sit in the first block, so it decides whether the rest is worth decoding

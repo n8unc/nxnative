@@ -249,6 +249,14 @@ To enroll a cut for any game's own module:
 - **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) `main` (.NET NativeAOT).
 - **Check:** no module of the 19 other games on hand has a data block, and their rewrites are byte-identical.
 
+### NRO metadata inside the text segment
+
+- **Symptom:** `RuntimeError: 44 ldr x18, #0xfffffffffff40370` while rewriting an NRO.
+- **Cause:** an NRO's text segment includes its metadata header. The arbitrary build ID at `+0x40` can decode as instructions; `magic_0898_2015.nro` contains a literal load into `x18` at `+0x44`. The ordinary 4 KB data-gap heuristic cannot exclude this 120-byte header.
+- **Fix:** `nso_code.data_blocks` explicitly excludes `+8..+0x80` when the image has the `NRO0` header. The initial entry branch and MOD0 pointer remain intact, and scanning resumes at the first possible function. NSO scanning is unchanged.
+- **Found on:** [FINAL FANTASY X/X-2 HD Remaster](../../dm/games/0100BC300CB48000/README.md), 1,432 registered NROs.
+- **Check:** `test_nro_header.py` runs the real rewriter on a synthetic NRO whose build ID decodes as an `x18` load, checks the header byte-for-byte, and checks that an actual `x18` instruction immediately after it is rewritten.
+
 ## Stack and system registers
 
 ### Stack pointer writes through x18
