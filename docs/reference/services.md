@@ -536,6 +536,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** hooked: `settings::LanguageCode::Make` and the reversed `operator==(LanguageCode, Language)`.
 - **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (SDK 10).
 
+### Chinese language aliases in settings comparisons
+
+- **Symptom:** `DM_LANG=zh-Hans` or `zh-Hant` reaches the game unchanged, but its startup menu falls back to Japanese; the older `zh-CN` or `zh-TW` spelling selects Chinese.
+- **Cause:** Odyssey 1.4.1's language selectors (`main+0x977b30`, `main+0x977d30`) compare the desired code through `settings::operator==(LanguageCode, Language)` with only the deprecated `Language::Chinese` (6) and `Taiwanese` (11) entries, never `SimplifiedChinese` (15) or `TraditionalChinese` (16); its control data lists Simplified and Traditional Chinese, which the NSP script spells `zh-Hans` and `zh-Hant` (it turns `zh-CN` and `zh-TW` into those too). The real operator compares bytes with `MakeLanguageCode`, so on the console the system must hand this game `zh-CN` / `zh-TW`; the host compared bytes the same way with `DM_LANG`'s spelling, so `zh-Hans` did not match `zh-CN` and `zh-Hant` did not match `zh-TW`.
+- **Fix:** both settings equality hooks share an alias-aware comparison (`hle_sdk16.c`): Simplified Chinese's two spellings match each other, as do Traditional Chinese's. The scripts stay distinct; `GetDesiredLanguage`, `LanguageCode::Make` and the available language list keep their original codes and indices. No title-specific override. This stands in for the system's choice of spelling, whose rule per title is not known (open): a game that compares the code with its own strings, or looks up `zh-CN`'s index in the available list, still needs the exact spelling. A synthetic full matrix tests both operand orders, malformed codes and the unchanged list.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (1.4.1, SDK 7.3.2; fresh-save Mac startup menus in Simplified and Traditional Chinese after the comparison fix).
+
 ### Available language codes and their count
 
 - **Symptom:** abort in `sm::Initialize` under `nn::settings::GetAvailableLanguageCodes` (early in `nnMain`, `main+0x327888`); abort in `sm::Initialize` under `nn::settings::GetAvailableLanguageCodeCount()` (`main+0x117590`).

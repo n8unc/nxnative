@@ -126,6 +126,31 @@ do not allow growth.
 `scripts/bug_report.py` (`-h`) collects the logs, versions and settings a bug report needs into one zip ([CONTRIBUTING.md](../CONTRIBUTING.md#reporting-a-problem)); it reads an allow-list of text files only.
 For a Mac app, it reads the name, title ID and game version from `Info.plist`, lists the chain folders in `Contents/Resources/msl`, and includes both the player's and the bundle's `env.txt`. Recorded `DMCommit` and `DMChain` values take precedence; an app without a commit stamp reports its commit as unknown. The collector's checkout and chain are labeled separately. An NSP build lists available chain folders under `shader/cache` (Mac), `shader/ios` (iOS) and `shader`; old cached folders do not identify the chain that ran. The 4 MB file limit and 20 MB bundle limit include `report.md` and truncation markers; space for the report is reserved before logs are collected. Explicit `.keys` inputs are refused.
 
+`.github/workflows/fuzz.yml` fuzzes the Python parsers of files a player
+supplies, nightly and by hand (never on pull requests): the RomFS image reader
+(`romfs.py`), the control data (`nacp.py`), the NSO loader, the shader
+containers of `shader_split.py` (BNSH, BAHS, MSHD, SARC / Yaz0, GLSLC, SDF,
+ARH1 and the others `scan_blob` recognizes) and the Unreal paks and shader
+archives of `uepak.py`. Each harness, `dm/tools/fuzz/fuzz_<parser>.py`, builds
+its seeds in code and mutates them for 60 s; nothing comes from a game. A
+finding is an exception other than the parser's declared rejection (each
+harness's docstring says which), a hang or an oversized allocation. Its input
+goes into `dm/tools/fuzz/corpus/<parser>/`, and `dm/tools/tests/test_fuzz_corpus.py`
+replays the corpus with the tool tests on every pull request; an open finding
+has a row in `dm/tools/fuzz/known.tsv` (its signature, its issue) and replays as
+an expected failure until the parser is fixed, when the row comes out. Locally,
+`python3 dm/tools/fuzz/fuzz_romfs.py --time 300` runs a harness: with atheris
+(`.github/requirements/fuzz.txt`) coverage-guided, without it on a blind random
+engine. atheris has no macOS wheel; it builds from source with an LLVM that
+ships libFuzzer (Apple's Clang does not):
+
+```sh
+python3 -m venv /path/to/fuzz-venv && /path/to/fuzz-venv/bin/pip install lz4
+SDKROOT=$(xcrun --show-sdk-path) CLANG_BIN=/path/to/llvm/bin/clang CC=/path/to/llvm/bin/clang CXX=/path/to/llvm/bin/clang++ \
+  /path/to/fuzz-venv/bin/pip install 'git+https://github.com/google/atheris@e36da74cf42b5834c4e31d7cabb58d796695d29f'   # 3.1.0 (Python 3.14 support) has no source release on PyPI
+/path/to/fuzz-venv/bin/python dm/tools/fuzz/fuzz_shader_split.py --time 300 --findings /path/to/scratch/findings
+```
+
 ## The packing script in detail
 
 `scripts/build_ipa_from_nsp.py` (`-h` lists every option):
@@ -399,7 +424,7 @@ Each game has a profile in `dm/games/<id>/`:
 - the shader tables: `shader_map.tsv`, `shader_facts.tsv`, `shader_pairs.tsv`, `pso_pairs.tsv` (pairs used by vertex output padding and the pipeline prebuild), `pso_manifest.tsv`, and `c1_full.tsv` / `cb_extent.tsv`, which each checkout's full shader build makes (not committed);
 - `patches.py` (when there are any): the rewriter's patches of the game's own builds.
 
-The shader translation chain has one version for every game, in `dm/gfx/nvn/dmsh_chain.h`.
+The shader translation chain has one version for every game, in `dm/gfx/nvn/dmsh_chain.h`. What the shader libraries and the host must agree on, the NVN driver segment layout and the binding kinds of the reflection, is written once in `dm/gfx/nvn/dmsh_abi.h`: the host includes it, the build reads it through `dm/gfx/tools/dmsh_abi.py`, and `dm/tools/tests/test_dmsh_abi.py` guards it ([Shaders, Bindings and handles](reference/shaders.md#bindings-and-handles)).
 
 The shader tools pick a profile with `DM_GAME=<id>`; `make -C dm/host` and `build_ipa.sh` pick it with `GAME=<id>`. Profiles are named after the base game's title ID. There is no default game: without `GAME` / `DM_GAME` the tools stop and list the profiles. `python3 dm/games/game.py list` lists the profiles. Host code that relies on one build's fixed addresses checks that build's ID.
 
