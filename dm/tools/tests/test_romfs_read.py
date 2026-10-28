@@ -53,7 +53,7 @@ class ReadImage(unittest.TestCase):
             with romfs.mmap.mmap(f.fileno(), 0, access=romfs.mmap.ACCESS_READ) as m:
                 self.assertEqual(len(m), len(self.data)); self.assertEqual(m[:], self.data)
                 self.assertEqual(struct.unpack_from('<I', m)[0], 0x07230203)
-                self.assertEqual(re.search(b'ABC', m).start(), 4)
+                found = re.search(b'ABC', m); assert found is not None; self.assertEqual(found.start(), 4)
                 self.assertEqual(hashlib.sha256(m).digest(), hashlib.sha256(self.data).digest())
                 self.assertEqual(m.find(b'ABC'), 4); self.assertEqual(m.rfind(b'ABC'), len(self.data) - 4)
                 self.assertEqual(m.find(b'archive member'), -1)
@@ -76,6 +76,15 @@ class ReadImage(unittest.TestCase):
         # Image replacement must invalidate the process's cached index.
         (self.src / 'new').write_text('new entry'); romfs_image.pack(self.src, self.image)
         self.assertEqual((self.virtual / 'new').read_text(), 'new entry')
+
+    @unittest.skipUnless(shutil.which('zstd'), 'zstd command required')
+    def test_zstd_file_inside_an_image(self):
+        # Mario Wonder's .zs files: the zstd command cannot open a path inside the image, so unzs feeds it the bytes.
+        with patch.dict(os.environ, DM_GAME='010020D01AD24000'):
+            import shader_split
+        (self.src / 'data/table.byml.zs').write_bytes(subprocess.run(['zstd', '-c', '-q'], input=self.data, capture_output=True, check=True).stdout)
+        romfs_image.pack(self.src, self.image)
+        self.assertEqual(shader_split.unzs(str(self.virtual / 'data/table.byml.zs')), self.data)
 
     def test_ipa_packer_keeps_image_as_one_file_and_reuses_it(self):
         out = self.root / 'game.ipa'

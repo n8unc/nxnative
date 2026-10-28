@@ -34,14 +34,30 @@
 - **Fix:** the NSP pipeline passes `--romfs-image` to `nx_extract`. LibHac layers the update over the base and checks its integrity while the writer streams file bytes into a temporary `DMROMFS1` image, appends the sorted directory index and publishes by rename. ExeFS remains expanded; RomFS and each DLC remain one physical file. `dm/tools/romfs.py` gives the scanners read-only virtual paths, bounded seeks and archive mappings (Python 3.12+), without changing the process's standard filesystem APIs. The IPA packer maps the physical image to `Payload/DmIOS.app/romfs.img`; iOS and the Mac launcher validate and mount it in place. Neither installation nor startup expands the resource files. Documents overrides and legacy folder inputs remain supported. A source image is uncompressed; the IPA can deflate it, so file-count reduction does not imply a smaller installed byte count. Full images for separate game versions cannot share unchanged individual files through APFS clones as legacy folder extraction did.
 - **Found on:** [ANIMAL WELL](../../dm/games/010020D01AD24000/README.md#files), whose direct image is an empty root (56 bytes); the local Baba Is You provisional build exercises 6,374 files in a 103,473,292-byte image, 131 shaders and an unsigned IPA containing only the single image entry. [Raging Loop](../../dm/games/010020400E1C2000/README.md#files-and-shaders) supplies Unity resources: all 1,473 source manifest entries match the image, and every registered shader remains in the scan. Synthetic integration tests call the actual LibHac writer, read unaligned archive ranges, and exercise IPA mapping, Xcode staging and bundled-image startup.
 
+### The zstd command given a path inside the image
+
+- **Symptom:** the NSP script stops at the shader split of a registered profile with `[RED] 13744 file(s) could not be read, their shaders are left out (first: AI/FileEntry/FileEntry.Product.100.byml.zs: CalledProcessError: Command ['zstd', '-d', '-c', '-q', '…/extract/v0/RomFS.img/AI/…'] returned non-zero exit status 1.)`.
+- **Cause:** `shader_split.py`'s `unzs` read a `.zs` file through `romfs.open`, which reads inside the image, but then handed its path to the `zstd` command, which can only open real files (`Not a directory`).
+- **Fix:** `unzs` feeds the command the bytes it read (`input=`). No other tool hands an external command a path inside the image. Test: `test_romfs_read.py` `test_zstd_file_inside_an_image`.
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md#shaders): every file of its RomFS is zstd-compressed, 13,744 left out in both versions; the first image-backed build after the folder extraction.
+
+## Launcher metadata
+
+### A Mac front end's default settings change Metal execution paths
+
+- **Symptom:** starting a Mac app through a front end with unchanged settings enables the encode thread, and can disable Metal 4 pipelines and the pipeline archive; starting the same app from Finder keeps the host's defaults.
+- **Cause:** Mac `launcher.json` reused iOS defaults from `settings.tsv`. `rec_on` in `nvn_rec.h` defaults off on Mac and on on iOS; `pso4_on` in `nvn_mtl.m` defaults on on Mac and follows the profile on iOS. The exported defaults instead enabled the encode thread everywhere and followed the profile for Metal 4 everywhere. A front end applying those values changed the Mac host's behavior without a player override.
+- **Fix:** a setting's default may be `<ios>|<mac>`, selected before resolving a profile macro or build variable. Metal 4 uses `DM_GAME_PSO_MTL4|1`, the encode thread `1|0`. The generator validates the platform and the pair. Tests cover a profile with Metal 4 on and one with it off, and both platforms; the host and shader chain are unchanged.
+- **Found on:** synthetic metadata generation for [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) while reviewing [PR #352](https://github.com/seedds/nxnative/pull/352); checked against the native defaults, without a gameplay run.
+
 ## Compressed inputs
 
 ### NSZ decompression rejects `--keys`
 
 - **Symptom:** `decompress NSZ` stops immediately with `nsz: error: unrecognized arguments: --keys …`.
-- **Cause:** `nsz` 4.6.1 has no `--keys` argument. It loads `keys.txt` beside `sys.argv[0]`, or falls back to `~/.switch/prod.keys`, while importing its modules, before parsing arguments ([4.6.1 key loader](https://github.com/nicoboss/nsz/blob/4.6.1/nsz/nut/Keys.py)). Newer upstream code supports `--keys`; staging `keys.txt` also supports 4.6.1.
-- **Fix:** `scripts/build_ipa_from_nsp.py` `decompress_nsz` links the file selected by `-k` as `keys.txt` in the conversion's temporary folder and runs `nsz -D` there, with `sys.argv[0]` set to `nsz` before import. Input and output paths are absolute. The temporary folder and link are removed on success or failure; the user's default keys are untouched.
-- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md), converting its v0 NSZ. Applies to NSZ and XCZ inputs for every game.
+- **Cause:** `nsz` 4.6.1 has no `--keys` argument. It loads `keys.txt` beside `sys.argv[0]`, or falls back to `~/.switch/prod.keys`, while importing its modules, before parsing arguments ([4.6.1 key loader](https://github.com/nicoboss/nsz/blob/4.6.1/nsz/nut/Keys.py)). Version 5.0 supports `--keys` ([argument parser](https://github.com/nicoboss/nsz/blob/5.0.0/nsz/ParseArguments.py)); staging `keys.txt` also supports 4.6.1.
+- **Fix:** `scripts/build_ipa_from_nsp.py` `decompress_nsz` prefers the current Python's module: it links the file selected by `-k` as `keys.txt` in the conversion's temporary folder and runs `nsz -D` there, with `sys.argv[0]` set to `nsz` before import. Without the module, `nsz_command` probes `nsz` and `nsz-cli-macos-arm64` on the build's PATH and passes `--keys` to the first whose successful help lists that option. An unsupported or failed candidate does not hide the next one; when none works, the error lists the reasons and installation options. Executable, input and output paths are absolute because conversion changes directories. The temporary folder and link are removed on success or failure; the user's default keys are untouched.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md), converting its v0 NSZ. Applies to NSZ and XCZ inputs for every game. Synthetic tests during [PR #327](https://github.com/seedds/nxnative/pull/327) also reproduce an older console script hiding the release binary, a failed help probe containing `--keys`, and a relative PATH executable failing after the directory change; no game files are needed for those cases.
 
 ## Cartridge dumps
 

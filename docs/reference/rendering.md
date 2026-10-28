@@ -4,6 +4,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 
 ## Textures and formats
 
+### Null textures in diagnostic logs
+
+- **Symptom:** clang reports null dereferences in `nvnWindowInitialize` and `clear_tex`; clearing a null texture crashes with `DM_NVN_PASSDUMP=1`.
+- **Cause:** window initialization checked the texture count but logged the first texture's dimensions without checking its pointer. Clear replay tolerated a null texture but its pass dump unconditionally read the texture serial.
+- **Fix:** check the first texture before logging its dimensions (`hle_nvn.c`) and log serial 0 for a null clear texture (`nvn_mtl.m`).
+- **Found on:** clang static analysis ([issue #424](https://github.com/seedds/nxnative/issues/424)); synthetic null-texture tests, with no gameplay failure reported.
+
 ### Texture objects copied into command records
 
 - **Symptom:** Metal aborts on a texture descriptor with an absurd size (`height (1869367126) greater than … 16384`).
@@ -329,22 +336,31 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 
 ### Same-pass feedback read through a snapshot
 
-- **Symptom:** solid magenta blocks, exactly (255, 0, 255), hard-edged and aligned to the 16-pixel grid (16×16, sometimes two stacked): Super Mario 3D World showed them only on the iPhone; Captain Toad on a Mac, Apple M6, in about half the frames of the opening course, moving with the falling leaves.
+- **Symptom:** solid magenta blocks, exactly (255, 0, 255), hard-edged and aligned to the 16-pixel grid (16×16, sometimes two stacked): Super Mario 3D World showed them only on the iPhone; Captain Toad on a Mac, Apple M6, in about half the frames of the opening course, moving with the falling leaves. On an RG11B10F target (no alpha) the blocks are pure black or neon green, (0, 252, 0), and flicker, sometimes only part of a tile: Super Mario Bros. Wonder on an Apple M6 and an M1, most visible on the speech bubbles of dialogue.
 - **Cause:** a program writes an attachment while sampling it (agl's post-effect program writes the 1920x1080 RGB10A2 image as an attachment while sampling it). Writing and sampling one attachment within a render pass is undefined in Metal: the M4 Pro happens to return the old content, while the A20 Pro now and then returns whole 16×16 blocks as (1, 0, 1), probably blocks of the compressed render target caught mid-write. On the Switch the read returns the content from before the draw.
 - **Fix:** for the fragment shaders the profile's `feedback_snap` key lists, the host ends the pass before such a draw, copies the attachment's level and layer into a snapshot texture in the replay stream, and binds the snapshot for that draw (`fb_prepare` in `nvn_mtl.m`). The binding scan covers combined slots 0–127 and separate texture slots 128–255 (`NTEX`), using the argument encoder's handle lookup; an earlier bound of 128 silently skipped separate bindings even for a listed shader. A sampled view that spans more levels than the attachment's one is left as before with a red line.
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_feedback` exercises the production snapshot and argument encoder at slots 0, 128 and 255. GPU readback must retain a red snapshot after the original attachment is overwritten green, then read the green original on the next draw. The old slot bound fails 10 of 56 checks; the corrected bound passes all 56 with Metal API validation on the M4 Pro.
 - **Found on:**
   - [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md): `DM_NVN_MAGSCAN` on the A20 Pro found the blocks first in the 1920×1080 RGB10A2 composite (`ser=30`) in World 1-1, in the pass whose shader `66a71a3081b91b9a` renders into that texture while sampling it. They kept appearing with the sparkle particle `5e4de7561c670fee` dropped, so that earlier suspect (picked by position) is not the cause. `feedback_snap` lists `66a71a3081b91b9a` and `30e3ccb0bd304ead` (which samples a G-buffer target of its own pass on the title screen); in 1-1 that is one 8 MB copy per frame. `3e8567da37eb28a1` renders level 1 of a texture while its view covers levels 0–4 (mip-chain passes) and keeps the red line. The source said the fix was in place and waiting for a device run when written; the README lists the game as tested and playable on the iPhone.
   - [Captain Toad: Treasure Tracker](../../dm/games/01009BF0072D4000/README.md): agl's post-effect program 987 (`54f58a7cab608766`, the same program as 3D World's `66a71a3081b91b9a` in another build); `DM_NVN_FB_SNAP=all` cleared every frame and named this one shader, now in the profile's `feedback_snap`.
-- **Note:** doing it for every shader is too expensive: Breath of the Wild has over a thousand draws a frame that sample the G-buffer of their own pass (Mac frame time 16.6 → 36.6 ms), and Mario Wonder's submit time went from 1.4 to 4.0 ms. Those games' feedback draws (Mario Wonder `a7e5c6fd501cf21f` and `22a61cb1ec732aef` on its RG11B10F scene; BotW `4d3d5a4408c2e8d9`, `753d0169ae3ce4f0` and others on its 1600×900 G-buffer) had shown no blocks on the iPhone; if they do, `DM_NVN_MAGSCAN` names the pass and the shader goes into that profile's `feedback_snap`. `DM_NVN_FB_SNAP=all` snapshots every such draw.
+  - [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md#rendering): black and green blocks on the Mac (Apple M6; an M1 in [seedds/nxnative#377](https://github.com/seedds/nxnative/issues/377)) from its two feedback draws `a7e5c6fd501cf21f` and `22a61cb1ec732aef` on the RG11B10F scene, the same keys in v0 and 1.2.1, which had shown nothing on the iPhone. Screenshots with a flicker detector: v0's opening course 6 of 160 frames with blocks before, 0 of 150 with both in `feedback_snap`; 1.2.1's Badge House dialogue 23 of 158 before, 0 of 158 after.
+- **Note:** doing it for every shader is too expensive: Breath of the Wild has over a thousand draws a frame that sample the G-buffer of their own pass (Mac frame time 16.6 → 36.6 ms), and Mario Wonder's submit time went from 1.4 to 4.0 ms. Breath of the Wild's feedback draws (`4d3d5a4408c2e8d9`, `753d0169ae3ce4f0` and others on its 1600×900 G-buffer) had shown no blocks on the iPhone; if they do, `DM_NVN_MAGSCAN` names the pass and the shader goes into that profile's `feedback_snap`. `DM_NVN_FB_SNAP=all` snapshots every such draw; with a screenshot detector it shows whether the blocks come from such a draw, and a pass dump (`N … same-pass feedback sampling` lines after the draw's `K` keys) names the shaders.
 
 ### Lower-left window origin
 
 - **Symptom:** text a game renders into textures for the title and the menus comes out upside down, while the scene looks right.
 - **Cause:** a game that never calls `nvnDeviceSetWindowOriginMode` keeps NVN's default, lower-left (OpenGL), where NDC y = -1 lands on a render target's first memory row. Read as upper-left, every texture the game renders and samples came out flipped and cancelled out, but not the text, and the game copies the frame with `MIRROR_Y`.
-- **Fix:** viewport and scissor rectangles, fragment coordinates, copies and texture coordinates address the same memory rows in both conventions, so the host only flips the direction inside the viewport (negative viewport height), reverses the front-face winding, and flips the window image at present and in raw screenshots (`g_origin_ll` in `nvn_mtl.m`).
+- **Fix:** viewport and scissor rectangles, fragment coordinates, copies and texture coordinates address the same memory rows in both conventions, so the host flips the direction inside the viewport (negative viewport height) and flips the window image at present and in raw screenshots (`g_origin_ll` in `nvn_mtl.m`). Facing also follows the [raster flip captured at queue initialization](#queue-initialization-captures-the-raster-origin).
 - **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md); the six games before it all switch to upper-left.
 - **Note:** the window's Y-direction system register under this origin is open ([Open: the window Y-direction register `SR_Y_DIRECTION`](shaders.md#open-the-window-y-direction-register-sr_y_direction)); the OpenGL layer renders through this origin ([GL orientation through the lower-left origin](#gl-orientation-through-the-lower-left-origin)), and Absolum combines it with a viewport swizzle ([Viewport swizzles applied as a flipped viewport](#viewport-swizzles-applied-as-a-flipped-viewport)).
+
+### Queue initialization captures the raster origin
+
+- **Symptom:** geometry appears inside out and almost black; a fullscreen indirect-lighting triangle is entirely culled even though its vertex data and polygon state match the game.
+- **Cause:** NVN emits `SET_WINDOW_ORIGIN.FLIP_Y` into a queue's initial GPU state. `DeviceSetWindowOriginMode` only changes the device field that later viewport construction reads; it does not rewrite an existing queue's raster flip. Deriving Metal winding from the current device origin loses this distinction when the game creates a queue before changing the origin. Reversing winding globally fixes that sequence but breaks games that set their origin first.
+- **Fix:** `queue_t.origin_ll` captures the device origin in `nvnQueueInitialize`. Each submission selects that queue's raster origin under the submission lock. Metal winding uses this captured origin; viewport direction and presentation keep using the device origin. The full-coverage proof also accounts for the difference between these origins, and for a negative-Y viewport swizzle.
+- **Check:** `t_queue_origin` alternates two queues created with different origins on one device. GPU readback checks CW/CCW triangles, both current device origins, every cull mode, `front_facing`, negative-Y swizzles and the full-coverage proof: 389 checks pass with direct and deferred Metal encoding; restoring the previous winding expression fails 48. The complete Metal suite passes. Mario Wonder's full smoke route passes with the fix.
+- **Found on:** [Xenoblade Chronicles 2](../../dm/games/0100E95004038000/README.md#rendering), with native SDK initialization evidence and the comparison with Mario Wonder recorded there.
 
 ### The residency set committed before a present
 
@@ -403,6 +419,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Cause:** Unreal's stencil shader resources are second textures on the depth buffer's storage built with `nvnTextureBuilderSetDepthStencilMode(STENCIL)`, which the host only logged, so the character occlusion mask read depth where it tests stencil bits.
 - **Fix:** the builder's mode now goes to the texture (`tex_t.stencil`), whose sampling view is the `X32_Stencil8` one a stencil-mode texture view already got.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the character occlusion mask, `edbfc7a088be545e`).
+
+### Conservative rasterization remains unimplemented
+
+- **Symptom:** `[nvn] SetConservativeRasterEnable on: ignored by host for now`, followed by `[RED] NVN unimplemented function called: nvnCommandBufferSetConservativeRasterDilate`.
+- **Cause:** `hle_nvn.c` ignores the enable setter and has no implementation for the dilation setter. The requested raster coverage state never reaches Metal.
+- **Fix:** **Open.** Neither setter has been implemented. The opening indoor scene renders and accepts input, but the visual contribution of the missing coverage state has not been isolated. The diagnostic remains visible.
+- **Found on:** [Pokémon Scarlet](../../dm/games/0100A3D008C5C000/README.md#open) (1.0.0, the first playable bedroom).
 
 ## Vertex input and draws
 
@@ -718,6 +741,14 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 - **Cause:** the replay binds every element of an array the shader takes, and a set may still name an image view the game has destroyed (the hardware reads a descriptor only when a draw samples it). The layer's descriptors were pointers to its own view, sampler and buffer structs.
 - **Fix:** a descriptor now holds the texture, sampler state and buffer it was written with (retained), as a hardware descriptor holds a copy of the handle.
 - **Found on:** [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md) (issue 68). Through the opening and the first storybook stage the game allocates 22,785 descriptor sets and frees none, and destroys only 5 image views (and 1,244 images), so a stale element is rare: a Mac run that kept destroyed objects to catch their binds found none there.
+
+### An unwritten secondary blend source
+
+- **Symptom:** Metal refuses a pipeline with "Fragment shader does not write to render target color(0), index(1) that is required for blending"; the Metal 4 specialization path can instead abort after `MTLCompilerService` crashes in `AGCLLVMStatelessFragmentObject::buildBlendFactor`.
+- **Cause:** NVN blend state reads source 1, but the fragment shader's output map writes only colour 0. Passing that state directly to Metal asks its blend compiler to read an absent secondary output.
+- **Fix:** for a known output map without colour 1, `pso_desc` chooses zero for the unwritten secondary source, consistently with the translator's dual-source output initialization (`Translator.EmitOutputsInitialization`). Source-1 colour / alpha factors become ZERO, and their complements become ONE. The shader, blend equation, blending enable and write mask remain intact. A written secondary source, an unknown output map or a separately specialized fragment is left alone. `t_missing_src1` compares both Metal pipeline paths against a shader explicitly writing a zero secondary source.
+- **Open:** the original GPU's value for an unwritten secondary source has not been measured; zero is the host's defined choice for that missing value.
+- **Found on:** [Mario + Rabbids Kingdom Battle](../../dm/games/010067300059A000/README.md).
 
 ### Dual-source blending from output location 1
 

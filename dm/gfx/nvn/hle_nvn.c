@@ -73,6 +73,7 @@ typedef struct { const char *name; void *fn; } nvn_impl;
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
+static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
 static unsigned g_nsem;                          // Number of semantic implementations (filled by nvn_init_slots)
 #define OLOG(...) do { if (g_log) LOG("[nvn] " __VA_ARGS__); } while (0)
@@ -556,6 +557,9 @@ NVN(nvnSamplerBuilderSetLodClamp, void, NVNsamplerBuilder *b, float lo, float hi
 NVN(nvnSamplerBuilderSetLodBias, void, NVNsamplerBuilder *b, float v) { SB(b)->lod_bias = v; }
 NVN(nvnSamplerBuilderSetCompare, void, NVNsamplerBuilder *b, NVNcompareMode m, NVNcompareFunc f) { SB(b)->cmp_mode = m; SB(b)->cmp_func = f; }
 NVN(nvnSamplerBuilderSetBorderColor, void, NVNsamplerBuilder *b, const float *c) { memcpy(SB(b)->border, c, 16); }
+// Metal's fixed border colours are selected numerically, also for integer textures. Bit-casting integer 1 to float would select transparent black instead of opaque black/white.
+NVN(nvnSamplerBuilderSetBorderColori, void, NVNsamplerBuilder *b, const int *c) { for (int i = 0; i < 4; i++) SB(b)->border[i] = (float)c[i]; }
+NVN(nvnSamplerBuilderSetBorderColorui, void, NVNsamplerBuilder *b, const uint32_t *c) { for (int i = 0; i < 4; i++) SB(b)->border[i] = (float)c[i]; }
 NVN(nvnSamplerBuilderSetMaxAnisotropy, void, NVNsamplerBuilder *b, float v) { SB(b)->aniso = v; }
 NVN(nvnSamplerBuilderSetLodSnap, void, NVNsamplerBuilder *b, float v) { (void)b; (void)v; }   // No Metal equivalent, ignored
 NVN(nvnSamplerBuilderGetMinMagFilter, void, const NVNsamplerBuilder *b, NVNminFilter *mi, NVNmagFilter *ma) {
@@ -697,10 +701,17 @@ NVN(nvnQueueBuilderGetQueueMemorySize, size_t, const NVNqueueBuilder *b) {
 }
 NVN(nvnQueueBuilderSetQueueMemory, void, NVNqueueBuilder *b, void *m, size_t n) { QB(b)->mem = m; QB(b)->mem_sz = n; }
 NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
-    *(queue_t *)q = (queue_t){MAGIC('Q', 'U', 'E', 'U'), ((const queue_builder_t *)b)->dev, 0};
+    NVNdevice *d = ((const queue_builder_t *)b)->dev;
+    // NVN emits SET_WINDOW_ORIGIN / FLIP_Y into the queue's initial GPU state.
+    // Changing the device origin later changes viewport construction, but does
+    // not rewrite that queue state (Xenoblade 2 creates its queue first).
+    *(queue_t *)q = (queue_t){MAGIC('Q', 'U', 'E', 'U'), d, 0,
+                            !d || ((const dev_t_ *)d)->origin == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT, nvn_new_serial()};
     OLOG("QueueInitialize %p", (void *)q); return 1;
 }
-NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
+NVN(nvnQueueFinalize, void, NVNqueue *q) {
+    pthread_mutex_lock(&g_sub_mu); mtl_queue_forget(((queue_t *)q)->serial); ((queue_t *)q)->magic = 0; pthread_mutex_unlock(&g_sub_mu);
+}
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
@@ -1168,12 +1179,13 @@ void dm_gfx_suspend(int on) {
 // One submission at a time: the Metal replay keeps one command buffer and one upload batch for the submission in progress (nvn_mtl.m g_cb). Fire Emblem: Three Houses initializes two queues and
 // submits on both from two threads; the second submission arrived while the first was replaying and the host stopped with "submit re-entered" at the ninth frame. NVN orders work on different queues only
 // through syncs, so replaying the two queues' submissions in lock order is one valid order
-static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
     pthread_mutex_lock(&g_sub_mu);
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     ((queue_t *)q)->submits++;
+    mtl_queue_activate(((const queue_t *)q)->serial);
+    mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
     mtl_sub_begin();
     nvn_ft_poll();
     mtl_sub_index((const uint64_t *)h, n);
@@ -1249,7 +1261,7 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     memcpy(o->tex, s->tex, sizeof o->tex);
     for (int i = 0; i < o->ntex; i++) if (o->tex[i]) mtl_xv_window_tex(CTX(o->tex[i])->serial);
     LOG("[nvn] WindowInitialize swap chain %d textures, interval %d, first %dx%d format %#x", o->ntex, o->interval,
-        o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);
+        o->ntex && o->tex[0] ? (int)CTX(o->tex[0])->d.width : 0, o->ntex && o->tex[0] ? (int)CTX(o->tex[0])->d.height : 0, o->ntex && o->tex[0] ? CTX(o->tex[0])->d.format : 0);
     return 1;
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
@@ -1679,14 +1691,14 @@ static int fstep_hold(void) {
 }
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
-static void fstep_tick(const win_t *o) {
+static void fstep_tick(const win_t *o, int c) {
     static uint64_t prev, t0, v0, fixed_sum, held[FSTEP_MAX + 1]; static int nlog;
     const double v = 1e9 / 60;
     uint64_t st = g_fs_start ? g_fs_start : now_ns(), pw = g_fs_wait; g_fs_start = g_fs_wait = 0;
     double shown = prev ? (st - prev) / v : 0, gpu = 0; prev = st;
     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
     double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
-    int c = fps_step_cap(), kmin = 60 / c, kmax = !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k, kmin0 = g_fs.kmin, probe0 = g_fs.probe;
+    int kmin = 60 / c, kmax = !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k, kmin0 = g_fs.kmin, probe0 = g_fs.probe;
     int fixed = (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED);
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one
@@ -1736,8 +1748,9 @@ static void fstep_tick(const win_t *o) {
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_fps_lock_tick();
-    if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (__atomic_load_n((uint32_t *)(dm_fps_state + 4), __ATOMIC_RELAXED) ? " (prerendered movie)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
-    if (fstep_on()) fstep_tick(o);
+    int c = fps_step_cap();
+    if (dm_fps_state) { static int was; if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (__atomic_load_n((uint32_t *)(dm_fps_state + 4), __ATOMIC_RELAXED) ? " (prerendered movie)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
+    if (c) fstep_tick(o, c);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);
     {

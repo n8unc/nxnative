@@ -7,9 +7,6 @@
 # from its Mac outputs. One output directory per game: the chain version is the same for every game   Environment: DM_GAME=game profile (required, dm/games/<id>), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), J=concurrency (default the number of cores)
 # Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
-# Environment IOS_ONLY=1 (with IOSOUT): no Mac libraries, for an iPhone build, which does not use them (about half the Metal compile time). The Mac folder still gets each shader's MSL and reflection,
-# which c1_guard.py and cb_extent.py read, and the stamp; the entry points that may be dropped (layer, integer outputs) are decided by the iOS compile. Its shader and variant cache entries
-# are kept apart from those of builds with Mac libraries, so a later Mac build never restores one without its library
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
 import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
 import dmsh_geometry, dmsh_atomic
@@ -27,12 +24,17 @@ XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate')
 SPIRV_CROSS = dmsh_chain.SPIRV_CROSS   # the in-repo build the lock records
 FACTS = dmsh_facts.load()
 if not os.path.exists(dmsh_facts.TABLE): sys.exit(f'[RED] no answer table {dmsh_facts.TABLE} (it comes with the game profile; an empty table = every query answered with defaults)')
-IOSOUT = os.environ.get('IOSOUT')   # if set, also build the iOS version (iphoneos metallib + reflection) into that directory
+IOSOUT = os.environ.get('IOSOUT')   # destination for requested iOS libraries (iphoneos metallib + reflection)
+# Which metallibs this run builds: DMSH_TARGETS=mac,ios (default: both when IOSOUT is set, else mac). The Mac
+# sources and reflection are written even when 'mac' is left out (the profile's c1_full / cb_extent tables are
+# made from them), so an iOS-only build skips only the macOS compile, about half of the Metal work.
+TARGETS = {t.strip() for t in (os.environ.get('DMSH_TARGETS') or ('mac,ios' if IOSOUT else 'mac')).split(',') if t.strip()}
+if not TARGETS or not TARGETS <= {'mac', 'ios'}: sys.exit(f'[RED] DMSH_TARGETS takes mac and/or ios: {",".join(sorted(TARGETS)) or "empty"}')
+if 'ios' in TARGETS and not IOSOUT: sys.exit('[RED] DMSH_TARGETS asks for iOS libraries without IOSOUT')
+if 'ios' not in TARGETS: IOSOUT = None   # every side library, cache, cleanup and stamp follows the same selection
 if IOSOUT:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
-MAC_LIBS = os.environ.get('IOS_ONLY') != '1'
-if not MAC_LIBS and not IOSOUT: sys.exit('[RED] IOS_ONLY=1 builds only the iOS libraries: set IOSOUT too')
 for _d in [out] + ([IOSOUT] if IOSOUT else []):   # one chain version serves every game, so b-<V>/ alone does not keep two games' libraries apart
     _g = dmsh_chain.read_stamp(_d).get('game')
     if _g and _g != GAME.id: sys.exit(f'[RED] {_d} holds the shader libraries of game {_g}, not {GAME.id}: give each game its own output directory')
@@ -114,7 +116,7 @@ def shader_key(key, name, rec):
     map_row = MAP_ROWS.get(key, 'missing'.encode()) + MAP_CONFLICT_ROWS.get(key, b'')
     payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc +
                b'\0tools\0' + TOOL_FP + b'\0code\0' + CODE_FP.encode() +
-               b'\0rule\0' + shader_rule_source(name) + b'\0profile\0' + PROFILE_ROWS + b'\0pairs\0' + ','.join(sorted(PAIRS.get(key, ()))).encode() + (b'' if MAC_LIBS else b'\0no mac libraries'))
+               b'\0rule\0' + shader_rule_source(name) + b'\0profile\0' + PROFILE_ROWS + b'\0pairs\0' + ','.join(sorted(PAIRS.get(key, ()))).encode())
     return hashlib.sha256(payload).hexdigest()
 def pair_keyed(digest, pixel_digests):   # a vertex shader's key with its pixel shaders' keys (vs_pad)
     return hashlib.sha256((digest + '\0' + ','.join(pixel_digests)).encode()).hexdigest()
@@ -124,16 +126,16 @@ def cache_path(digest): return os.path.join(CAS, 'shader', digest)
 
 def cache_outputs(key, digest, cached=False):
     root = cache_path(digest); files = {}
-    for label, directory, names in (
-            ('mac', out, [key + '_b.metallib', key + '_b.metal', key + '_b.json']),
-            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json'])):
+    for label, directory in (('mac', out), ('ios', IOSOUT)):
         if not directory: continue
+        # fin(), paired vertex padding and the profile tables also need these on an iOS-only cache hit.
+        required = [key + '_b.json'] + ([key + '_b.metal'] if label == 'mac' else [])
+        if label in TARGETS: required.append(key + '_b.metallib')
         base = os.path.join(root, label) if cached else directory
-        names += [key + s + ext for s in ('_bg0', '_bg1', '_bg2', '_bg3', '_bg4', '_bgv') for ext in ('.metallib', '.json', '.metal') if label == 'mac' or ext != '.metal']
-        libs = label == 'ios' or MAC_LIBS
-        if not libs: names = [n for n in names if not n.endswith('.metallib')]
+        names = required + [key + s + ext for s in ('_bg0', '_bg1', '_bg2', '_bg3', '_bg4', '_bgv') for ext in ('.metallib', '.json', '.metal')
+                            if (label == 'mac' or ext != '.metal') and (ext != '.metallib' or label in TARGETS)]
         found = [n for n in names if os.path.exists(os.path.join(base, n))]
-        if key + ('_b.metallib' if libs else '_b.metal') not in found or key + '_b.json' not in found: return None
+        if not all(n in found for n in required): return None
         files[label] = found
     return root, files
 
@@ -182,7 +184,7 @@ BF_STATS = collections.Counter()
 def bf_digest(msl, key):
     h = hashlib.sha256()
     h.update(msl.encode())
-    h.update(b'\0mac\0' + (MAC_RECORD if MAC_LIBS else 'none').encode())
+    h.update(b'\0mac\0' + MAC_RECORD.encode())
     h.update(b'\0ios\0' + (ios_metal.RECORD if IOSOUT else '').encode())
     h.update(b'\0metal\0' + METAL_FP.encode())
     h.update(b'\0bf-want\0' + (b'1' if key in BF_WANT else b'0'))
@@ -192,10 +194,10 @@ def bf_cache_root(digest): return os.path.join(CAS, 'variant', digest)
 
 def bf_cache_restore(key, digest, fmeta, fmsl):
     root = bf_cache_root(digest)
-    names = ['metal'] + (['mac.metallib'] if MAC_LIBS else []) + (['ios.metallib'] if IOSOUT else [])
+    names = ['metal'] + (['mac.metallib'] if 'mac' in TARGETS else []) + (['ios.metallib'] if IOSOUT else [])
     if not all(os.path.exists(os.path.join(root, n)) for n in names): return False
     clone(os.path.join(root, 'metal'), fmsl)
-    if MAC_LIBS: clone(os.path.join(root, 'mac.metallib'), os.path.join(out, key + '_bf.metallib'))
+    if 'mac' in TARGETS: clone(os.path.join(root, 'mac.metallib'), os.path.join(out, key + '_bf.metallib'))
     if IOSOUT: clone(os.path.join(root, 'ios.metallib'), os.path.join(IOSOUT, key + '_bf.metallib'))
     BF_STATS['hit'] += 1
     return True
@@ -230,9 +232,9 @@ def fetch_finish(key, src, refl):
             if not bf_cache_restore(key, digest, fmeta, fmsl):
                 BF_STATS['miss'] += 1
                 open(fmsl, 'w').write(fv)
-                fair = fmsl[:-6] + '.air'; flib = os.path.join(out, key + '_bf.metallib') if MAC_LIBS else None
+                fair = fmsl[:-6] + '.air'; flib = os.path.join(out, key + '_bf.metallib') if 'mac' in TARGETS else None
                 try:
-                    if flib:   # MAC_LIBS
+                    if flib:
                         tmp_flib = flib + '.tmp-' + str(os.getpid())
                         mac_compile(fmsl, fair, tmp_flib)
                         os.replace(tmp_flib, flib)
@@ -261,10 +263,10 @@ def pull_finish(key, full, refl):
     MSL-keyed Metal cache with the chain's flags; reflection 'pull' names its entry points, the layout block's buffer index and the inputs. Shaders without stage inputs get none
     (their pipelines have no vertex descriptor anyway), nor does a shader the variant does not fit (stale libraries removed). Changes refl; the caller writes it"""
     if refl['stage'] != 'vs': return refl
-    libs = ([('mac', os.path.join(out, key + '_bp.metallib'))] if MAC_LIBS else []) + ([('ios', os.path.join(IOSOUT, key + '_bp.metallib'))] if IOSOUT else [])
+    libs = [os.path.join(out, key + '_bp.metallib')] + ([os.path.join(IOSOUT, key + '_bp.metallib')] if IOSOUT else [])
     refl.pop('pull', None)
     def drop():
-        for _, p in libs:
+        for p in libs:
             try: os.unlink(p)
             except FileNotFoundError: pass
     v, info = dmsh_pull.variant(full)
@@ -274,7 +276,8 @@ def pull_finish(key, full, refl):
         drop(); return refl
     msl = os.path.join(w, key + '_bp.metal'); open(msl, 'w').write(v)
     try:
-        for target, lib in libs: MTL.compile(target, msl, lib)
+        if 'mac' in TARGETS: MTL.compile('mac', msl, libs[0])
+        if IOSOUT: MTL.compile('ios', msl, libs[1])
     except subprocess.CalledProcessError as e:
         PULL_STATS['failed'] += 1; print(f'[RED] {key}: the pulling library does not compile ({str(e)[:120]}): its pipelines are always built for the draw\'s vertex layout', flush=True)
         drop(); return refl
@@ -289,10 +292,10 @@ def vin_finish(key, full, refl):
     """The shadow-input library <key>_bv of a vertex shader with integer inputs (dmsh_vin.py), compiled through the MSL-keyed Metal cache; reflection 'vin' names its entry points and
     the shadow attribute indices. Other shaders get none (stale libraries removed). Changes refl; the caller writes it"""
     if refl['stage'] != 'vs': return refl
-    libs = ([('mac', os.path.join(out, key + '_bv.metallib'))] if MAC_LIBS else []) + ([('ios', os.path.join(IOSOUT, key + '_bv.metallib'))] if IOSOUT else [])
+    libs = [os.path.join(out, key + '_bv.metallib')] + ([os.path.join(IOSOUT, key + '_bv.metallib')] if IOSOUT else [])
     refl.pop('vin', None)
     def drop():
-        for _, p in libs:
+        for p in libs:
             try: os.unlink(p)
             except FileNotFoundError: pass
     v, shadows = dmsh_vin.variant(full)
@@ -302,7 +305,8 @@ def vin_finish(key, full, refl):
     VIN_STATS['generated'] += 1
     msl = os.path.join(w, key + '_bv.metal'); open(msl, 'w').write(v)
     try:
-        for target, lib in libs: MTL.compile(target, msl, lib)
+        if 'mac' in TARGETS: MTL.compile('mac', msl, libs[0])
+        if IOSOUT: MTL.compile('ios', msl, libs[1])
     except subprocess.CalledProcessError as e:
         VIN_STATS['failed'] += 1; print(f'[RED] {key}: the shadow-input library does not compile ({str(e)[:120]}): its integer inputs keep the CPU conversion', flush=True)
         drop(); return refl
@@ -867,7 +871,7 @@ def geometry_finish(key, w, j, c1):
                 'bindings': reflect(key, 'gs', src, res), 'vertex_inputs': [], 'raster': {}}
         def save(suffix, text, meta):
             path = os.path.join(out, key + suffix + '.metal'); open(path, 'w').write(text)
-            if MAC_LIBS: MTL.compile('mac', path, os.path.join(out, key + suffix + '.metallib'))
+            if 'mac' in TARGETS: MTL.compile('mac', path, os.path.join(out, key + suffix + '.metallib'))
             atomic_json(os.path.join(out, key + suffix + '.json'), MTL.with_compiler('mac', meta))
             if IOSOUT:
                 MTL.compile('ios', path, os.path.join(IOSOUT, key + suffix + '.metallib'))
@@ -941,19 +945,16 @@ def finish(key, w, j, c1):
         open(msl, 'w').write(full)
     fu, fmask = fs_uint(src) if j['stage'] == 'ps' else (None, 0)   # the integer-output entry points (see fs_uint); the analysis below uses the source with only main0
     if fu: plain = src; open(msl, 'w').write(fu)
-    # the first compile decides the extras: the Mac's, or with IOS_ONLY the iPhone's. MSL identical to one compiled before takes that library (dmsh_mtlcache.py)
-    if MAC_LIBS: first, first_lib, failed = 'mac', lib, 'metal failed'
-    else: assert IOSOUT; first, first_lib, failed = 'ios', os.path.join(IOSOUT, key + '_b.metallib'), 'iOS metal failed'
-    try: MTL.compile(first, msl, first_lib)
+    def compile_targets():   # the selected targets from the same MSL (MSL identical to one compiled before takes that library, dmsh_mtlcache.py)
+        if 'mac' in TARGETS: MTL.compile('mac', msl, lib)
+        if 'ios' in TARGETS and IOSOUT: MTL.compile('ios', msl, os.path.join(IOSOUT, key + '_b.metallib'))
+    try: compile_targets()
     except subprocess.CalledProcessError as e:
-        if not lay and not fu: return failed, str(e)[:160], None
+        if not lay and not fu: return 'metal failed', str(e)[:160], None
         open(msl, 'w').write(plain); lay = fu = None   # the layer and integer-output entry points are extras: a library that does not build with them is built without
-        try: MTL.compile(first, msl, first_lib)
-        except subprocess.CalledProcessError as e: return failed, str(e)[:160], None
+        try: compile_targets()
+        except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
-    if IOSOUT and MAC_LIBS:   # iOS: the same MSL goes through iOS's single compile convention (dm/ios/tools/ios_metal.py) to produce an iphoneos metallib
-        try: MTL.compile('ios', msl, os.path.join(IOSOUT, key + '_b.metallib'))
-        except subprocess.CalledProcessError as e: return 'iOS metal failed', str(e)[:160], None
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
@@ -990,7 +991,7 @@ for _spec in [cache_root + ('=' + os.path.dirname(IOSOUT) if IOSOUT else '')] + 
     _mac, _, _ios = _spec.partition('=')
     for _b in sorted(os.listdir(_mac)) if os.path.isdir(_mac) else []:
         if _b.startswith('b-') and os.path.realpath(os.path.join(_mac, _b)) != os.path.realpath(out):
-            for _ln in MTL.fill(os.path.join(_mac, _b), os.path.join(_ios, _b) if _ios else None): print(_ln, flush=True)
+            for _ln in MTL.fill(os.path.join(_mac, _b), os.path.join(_ios, _b) if _ios else None, targets=TARGETS): print(_ln, flush=True)
 packs, jobs, c1s = {}, {}, {}
 digests, rule_fps, cache_reasons, cache_hits = {}, {}, {}, set()
 def rec_of(key):   # → (package name, the shader's record)

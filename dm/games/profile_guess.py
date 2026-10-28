@@ -31,6 +31,12 @@ APP_POOL = 0xCD500000               # the application memory pool of a 4 GB Swit
 MiB = 1 << 20
 
 
+def glsl_sources(img):
+    """Complete embedded GLSL strings, rather than a compiler's language preamble. Snowdrop ships a #version header with typedefs but no entry point, even when it uses only archived shaders.
+    Three Houses embeds nine complete boot shaders. NRO callers that assemble shaders dynamically are detected separately by their glslcCompile import (build_sources)."""
+    return sum(bool(re.search(rb'\bvoid\s+main\s*\(', s)) for s in re.findall(rb'#version [^\0]*', img))
+
+
 def nso(path):
     """An NSO module: its three segments decompressed (the image without bss), build ID, segment sizes and bss size"""
     import lz4.block
@@ -89,7 +95,7 @@ def facts_of(exefs, romfs):
             if pat in img: F['markers'].setdefault(name, []).append(p.name)
         if p.name == 'main':
             F['unity'] = {v.decode() for v in re.findall(rb'20[12][0-9]\.[0-9]+\.[0-9]+f[0-9]', img)}
-            F['glslc'], F['glsl_src'], F['gl_names'] = img.count(GLSLC_MAGIC), img.count(b'#version '), img.count(b'glShaderSource')
+            F['glslc'], F['glsl_src'], F['gl_names'] = img.count(GLSLC_MAGIC), glsl_sources(img), img.count(b'glShaderSource')
             F['gl_src'] = len(re.findall(GL_SRC, img))
             F['main_markers'] = {name for pat, name in MARKERS if pat in img}
         m['kind'] = {'main': 'the game', 'sdk': 'nnSdk', 'rtld': 'rtld'}.get(p.name) or kind(m)
@@ -249,7 +255,7 @@ def romfs_nro_imports(romfs):   # the names the loose NROs in a RomFS import (th
 def build_sources(exefs, romfs, modules):
     """shader_sources from an extraction (its ExeFS and RomFS folders) and the modules the profile loads"""
     exefs = Path(exefs); main = nso(exefs / 'main')[0]
-    imports = {s for s, defined, _ in nso_syms.dynsyms(main) if not defined}; glsl_src = main.count(b'#version '); gl_names = main.count(b'glShaderSource'); gl_src = len(re.findall(GL_SRC, main))
+    imports = {s for s, defined, _ in nso_syms.dynsyms(main) if not defined}; glsl_src = glsl_sources(main); gl_names = main.count(b'glShaderSource'); gl_src = len(re.findall(GL_SRC, main))
     nro_imp = romfs_nro_imports(romfs)
     defines = lambda m: (exefs / m).exists() and any(s == 'glslcCompile' and defined for s, defined, _ in nso_syms.dynsyms(nso(exefs / m)[0]))
     glslc_mods = [m for m in modules if m != 'main' and glsl_src and 'glslcCompile' in imports and defines(m)]
@@ -283,6 +289,71 @@ def va_heap(sysres, imports):   # virtual address memory (an NPDM system resourc
 def heap_check_needed(exefs):   # va_heap from an extraction's ExeFS (the NSP script may reuse a provisional profile without surveying again)
     img = nso(Path(exefs) / 'main')[0]
     return va_heap(npdm(Path(exefs) / 'main.npdm')[0], {s for s, defined, _ in nso_syms.dynsyms(img) if not defined})
+
+
+def has_va(exefs):   # virtual address memory (an NPDM system resource): the game takes its memory as address regions of the alias region, which the region check measures
+    return bool(npdm(Path(exefs) / 'main.npdm')[0])
+
+
+def demangle(name):   # a nested Itanium name's parts (_ZN2nn3mem17StandardAllocator10InitializeEPvmb → nn::mem::StandardAllocator::Initialize); others as they are
+    m = re.match(r'_ZN(.*?)E', name)
+    if not m: return name
+    parts, t = [], m.group(1)
+    while (d := re.match(r'(\d+)', t)):
+        n = int(d.group(1)); parts.append(t[d.end():d.end() + n]); t = t[d.end() + n:]
+    return '::'.join(parts) or name
+
+
+def region_findings(table, alias, sdk_syms=None, secs=15):
+    """[(red, text)] from the host's address region table (DM_REGIONS, hle_svc.c "Address regions") of a run with a Switch-sized alias region, against the profile's alias
+    region (the layout an iPhone runs): where the regions reach, and for each of 256 MB or more where the request returns to in the game (the first return address outside the
+    sdk: the function that asked, or its caller when it tail-called the SDK API), through which SDK API (sdk_syms: the sdk's nso_syms.defined) and how much of it the game used.
+    The run covers the game's first secs seconds in nnMain: what it takes later in play is not in the table, so a reach within the alias region is a lower bound. Where a region stands depends on who lays it out, not on where it is used (Pokémon Legends: Z-A's StandardAllocator puts its 3.15 GB
+    startup block at the top of its region). One the SDK's StandardAllocator lays out the host makes fit at run time (hle_svc.c "StandardAllocator's address space": what the alias
+    region has room for, less 256 MB for the regions made after it); when those need more, the profile key stdalloc_cap sets the size, which this computes from them (Absolum: its
+    .NET garbage collector's region). One the game's own allocator takes with nn::os::AllocateAddressRegion works smaller only if that allocator places nothing by fixed offsets
+    (memory.md, A 62 GB page allocator behind nu::VirtualAllocHook)"""
+    rows = []
+    for l in table.splitlines():
+        c = l.split('\t')
+        if l.startswith('#') or len(c) != 7: continue
+        rows.append(dict(off=int(c[0], 0), size=int(c[1], 0), who=c[2], mapped=int(c[3], 0), end=None if c[5] == '-' else int(c[5], 0), via=int(c[6], 0)))
+    if not rows: return []
+    def via(off):
+        for name, (a, n) in (sdk_syms or {}).items():
+            if a <= off < a + max(n, 4): return demangle(name)
+        return None
+    gb = lambda n: f'{n / 2**30:.2f} GB'
+    out, red, own = [], [], []
+    for r in sorted((r for r in rows if r['size'] >= 0x10000000), key=lambda r: r['off']):
+        api = r['api'] = via(r['via']) if r['via'] else None
+        use = 'not used yet' if r['end'] is None else f'opened up to +{gb(r["end"])}'
+        line = f'{gb(r["size"])} at alias +{gb(r["off"])}' + (f' through {api}' if api else '') + f', returning to {r["who"]}: {gb(r["mapped"])} mapped, {use}'
+        if r['off'] + r['size'] <= alias: out.append((False, line)); continue
+        if api and 'StandardAllocator' in api:
+            # placed after it, they need room past its end on the iPhone (one too big by itself is reported as such)
+            later = sum(x['size'] for x in rows if x['off'] > r['off'] and x['size'] <= alias - NODE_AREA)
+            cap = (alias - r['off'] - later - 0x4000000) & ~0x1ffffff if alias > r['off'] + later + 0x4000000 else 0
+            if later <= STDALLOC_LATER: out.append((False, line + f'; on the iPhone layout the host gives it {gb((alias - r["off"] - STDALLOC_LATER) & ~0x1ffffff)}, what the alias region has room for'))
+            elif cap: red.append(f'the regions made after the one returning to {r["who"]} take {gb(later)}, more than the {gb(STDALLOC_LATER)} the host leaves them: stdalloc_cap {cap:#x} ({gb(cap)})')
+            else: red.append(f'the regions made after the one returning to {r["who"]} take {gb(later)}, which leaves it no room')
+            if later > STDALLOC_LATER: out.append((False, line))
+        else:
+            out.append((False, line))
+            if r['size'] > alias - NODE_AREA: own.append(r)   # too big by itself; a smaller one placed after a capped StandardAllocator region moves down with it
+    red += [f'the request returning to {r["who"]} takes {gb(r["size"])}' + (f' through {r["api"]}' if r['api'] else '') + ': a smaller one works only if its allocator places nothing by fixed offsets' for r in own]
+    reach = max(r['off'] + r['size'] for r in rows)
+    where = f'in its first {secs} s in nnMain the game\'s regions reach alias +{gb(reach)}'
+    capped = any(r.get('api') and 'StandardAllocator' in r['api'] and r['off'] + r['size'] > alias for r in rows)
+    if not red and reach > alias and not capped: red.append('no single region is too big, but together they need more room than the alias region has')
+    if red: out.append((True, f'{where}, past the profile\'s {gb(alias)} alias region, the iPhone layout: ' + '; '.join(red) + ' (docs/reference/memory.md, Virtual address memory and the alias region)'))
+    elif reach > alias: out.append((False, f'{where}, past the profile\'s {gb(alias)} alias region only by StandardAllocator regions, which the host makes fit (what it takes later in play is not measured here)'))
+    else: out.append((False, f'{where}, within the profile\'s {gb(alias)} alias region (what it takes later in play is not measured here)'))
+    return out
+
+
+STDALLOC_LATER = 0x10000000   # the room the host leaves after a StandardAllocator region (hle_svc.c STDALLOC_LATER)
+NODE_AREA = 0x3e00000         # the SDK's node area at the start of the alias region, with the SDK-wide cut (sdk_patches.py)
 
 
 def engine(F):   # keys that follow from the engine rather than from a general signal

@@ -16,6 +16,7 @@ import stat as _stat
 import struct
 import sys
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 HEAD = struct.Struct('<8sQQQ')
 ENT = struct.Struct('<QQIHBB')
@@ -135,15 +136,20 @@ class _File(io.RawIOBase):
         super().close()
 
 
-def open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, **kwargs):
-    resolved = _resolve(file) if not isinstance(file, int) else None
-    if not resolved: return builtins.open(file, mode, buffering, encoding, errors, newline, **kwargs)
-    if mode not in ('r', 'rb', 'rt'): raise OSError(errno.EROFS, 'RomFS images are read-only', file)
-    image, relative = resolved; k = image.find(relative)
-    if not image.entry(k)[4]: raise IsADirectoryError(file)
-    raw = _File(image, k)
-    reader = raw if buffering == 0 else io.BufferedReader(raw, io.DEFAULT_BUFFER_SIZE if buffering < 0 else buffering)
-    return reader if 'b' in mode else io.TextIOWrapper(reader, encoding=encoding, errors=errors, newline=newline)
+# Type checkers see the builtin's overloads, so a reader's open(..., 'rb').read() stays bytes and 'r' stays str.
+if TYPE_CHECKING:
+    from builtins import open
+else:
+    def open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, **kwargs):
+        resolved = _resolve(file) if not isinstance(file, int) else None
+        if not resolved: return builtins.open(file, mode, buffering, encoding, errors, newline, **kwargs)
+        if mode not in ('r', 'rb', 'rt'): raise OSError(errno.EROFS, 'RomFS images are read-only', file)
+        image, relative = resolved; k = image.find(relative)
+        if not image.entry(k)[4]: raise IsADirectoryError(file)
+        raw = _File(image, k)
+        if buffering == 0 and 'b' in mode: return raw
+        reader = io.BufferedReader(raw, io.DEFAULT_BUFFER_SIZE if buffering < 0 else buffering or io.DEFAULT_BUFFER_SIZE)
+        return reader if 'b' in mode else io.TextIOWrapper(reader, encoding=encoding, errors=errors, newline=newline)
 
 
 def stat(path, **kwargs):
