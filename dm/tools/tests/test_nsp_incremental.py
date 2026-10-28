@@ -198,6 +198,25 @@ class DeriveProfile(Base):
                 nsp.heap_check(REPO, self.ex, self.tmp / 'patched', self.tmp / 'work', {}, logs, g)
         self.assertEqual(g.table('game.tsv').read_bytes(), before)
 
+    def test_region_stamp_follows_the_rewrite(self):   # a derived build is checked once per rewrite: a new cut checks again, a reused derivation keeps the stamp
+        with (self.src / 'game.tsv').open('a') as f: f.write('mem_alias\t0x80000000\n')   # every profile has one (the host is built with it)
+        self.derive(); patched = self.tmp / 'work/patched_v65536'
+        logs = self.tmp / 'logs'; logs.mkdir()
+        def boot(*args): (logs / 'region_check.log').write_text('>>> nnMain\n'); (logs / 'regions.tsv').write_text('# table\n'); return 0
+        def check(key):
+            patched.with_name(patched.name + '.key').parent.mkdir(parents=True, exist_ok=True); patched.with_name(patched.name + '.key').write_text(key + '\n')
+            with mock.patch.object(nsp, 'build_mac_host'), mock.patch.object(nsp, 'boot_mac', side_effect=boot):
+                return nsp.region_check(REPO, self.ex, patched, self.tmp / 'work', {}, logs, game.Game(self.pdir))
+        g = check('a' * 64)
+        self.assertTrue(nsp.region_checked(g, patched))
+        self.derive(); self.assertTrue(nsp.region_checked(game.Game(self.pdir), patched))   # the derivation's inputs are unchanged: its stamp stays
+        patched.with_name(patched.name + '.key').write_text('b' * 64 + '\n')
+        self.assertFalse(nsp.region_checked(game.Game(self.pdir), patched))
+        g = check('b' * 64)
+        stamps = [l for l in g.table('game.tsv').read_text().splitlines() if l.startswith('# address regions: ')]
+        self.assertEqual(len(stamps), 1); self.assertTrue(stamps[0].endswith(f'(rewrite {"b" * 12})'))
+        self.assertNotIn('\n\n\n', g.table('game.tsv').read_text())
+
     def test_rewrite_changes_update_auto_mem_used(self):
         self.derive(); g = game.Game(self.pdir); reg = game.Game(self.src)
         with mock.patch.object(nsp.pg, 'mem_used') as used:

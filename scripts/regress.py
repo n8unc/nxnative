@@ -490,6 +490,12 @@ def modules_for(tree, g, rewrite, jobs):
     dst = game_root(g) / 'patched' / key / g.patched.name
     if (dst / '.done').is_file(): return dst, key
     mods = g.env(tree)
+    if not g.derived:
+        # Registered builds rewrite with this revision's original profile. The
+        # shader-table copy also contains patches.py; exposing both registers
+        # each build's cuts twice. Provisional profiles still need their path.
+        mods.pop('DM_GAMES_DIR', None)
+        mods.pop('DM_GAMES_FIRST', None)
     names = tree.py(f"import sys; sys.path.insert(0, 'dm/games'); import game; print(' '.join(game.load({g.id!r}).words('modules')))", mods).split()
     src = {m: g.build / 'extract' / g.ver / 'ExeFS' / m for m in names}
     nro = g.build / f'nro_{g.ver}' / 'nro.tsv'

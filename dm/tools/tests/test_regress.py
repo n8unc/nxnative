@@ -322,6 +322,25 @@ class Regress(unittest.TestCase):
             g = regress.Game(root, build)
             self.assertEqual(g.shader_roots(), [romfs, capture])
 
+    def test_rewriter_uses_original_registered_profile_and_keeps_provisional(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for derived in (False, True):
+                with self.subTest(derived=derived):
+                    env = {'DM_GAME': 'game', 'DM_GAMES_DIR': '/copied/profile', 'DM_GAMES_FIRST': '1'}
+                    g = NS(id='game', folder=root / str(derived), build=root / 'build', ver='v0',
+                           patched=root / 'patched_v0', derived=derived, env=lambda tree, config=env: dict(config))
+                    tree = NS(id='tree', path=root, py=lambda code, e: 'main')
+                    process = NS(poll=lambda: 0, returncode=0)
+                    with patch.object(regress, 'rewriter_key', return_value='key'), patch.object(regress, 'say'), \
+                         patch.object(regress.subprocess, 'Popen', return_value=process) as spawn, patch.object(regress.time, 'sleep'):
+                        dst, _ = regress.modules_for(tree, g, True, 1)
+                    selected = spawn.call_args.kwargs['env']
+                    self.assertEqual(selected.get('DM_GAMES_DIR'), env['DM_GAMES_DIR'] if derived else None)
+                    self.assertEqual(selected.get('DM_GAMES_FIRST'), '1' if derived else None)
+                    self.assertEqual(selected['DM_GAME'], 'game')
+                    self.assertTrue((dst / '.done').is_file())
+
     def test_vk_build_records_failure_even_without_generated_shaders(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); tool = root / 'dm/gfx/tools/vk_shaders.py'; tool.parent.mkdir(parents=True)

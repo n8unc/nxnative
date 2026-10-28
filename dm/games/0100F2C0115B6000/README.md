@@ -79,6 +79,8 @@ General host changes first needed here; each applies to every game:
 
 - **RomFS folder transfer and startup deletion failures:** [RomFS images](../../../docs/reference/packing.md#romfs-folder-transfers-fail-or-leave-stale-game-files).
 
+- **Resolved in the host (#531): `DM_NVN_GPUPROF` abort when an upload flush lands in a profiled draw pass:** [GPU profiles stamp only the encoder they began](../../../docs/reference/rendering.md#gpu-profiles-stamp-only-the-encoder-they-began). Covered by `t_gpuprof`; not rerun in the game.
+
 - **Resolved in the host (#342): recurring startup crash during archive compaction**, with a workaround for Metal's serializer defect: [Pipeline archive compaction crashes in Metal's serializer](../../../docs/reference/shaders.md#a-compaction-flush-that-crashes-then-crashes-every-start). Confirmed with local manifest replays; no new gameplay or iOS validation.
 
 - **BAHS pairs omitted from vertex padding:** [Pixel shader inputs the vertex shader does not write](../../../docs/reference/shaders.md#pixel-shader-inputs-the-vertex-shader-does-not-write).

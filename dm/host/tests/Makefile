@@ -172,6 +172,15 @@ $(B)/t_movie_vpx: t_movie_vpx.c ../hle_movie.c $(GAME_H) ../gen/vpx/libvpx.a | $
 $(B):
 	mkdir -p $@
 .PHONY: run tsan
+$(B)/t_resolution: t_resolution.c ../hle_fpslock.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -fsanitize=undefined -I.. $(GINC) -o $@ t_resolution.c
+.PHONY: resolution
+run: resolution
+resolution: $(B)/t_resolution
+	@for fps in 0 30 60; do for mode in 0 1 unset invalid; do $(B)/t_resolution $$mode $$fps native || exit 1; done; done
+	$(B)/t_resolution 1 60 old
+	$(B)/t_resolution 1 30 wrong
+	@for fps in 0 30 60; do for mode in 0 1 unset invalid; do $(B)/t_resolution $$mode $$fps asia || exit 1; done; done
 tsan: $(B)/t_audio_spsc_tsan $(B)/t_hid_tsan
 	$(B)/t_audio_spsc_tsan
 	$(B)/t_hid_tsan
