@@ -666,10 +666,15 @@ def footprint(pid):   # (current, lifetime peak) physical footprint in bytes (pr
 def normalize_red(line):
     s = line.split('[RED]', 1)[1].strip()
     s = re.sub(r'(/[^\s:;,()\'"]+)(\s+\S*/[^\s:;,()\'"]+)*', '<path>', s)   # a path, also one with spaces in its folder names
-    s = re.sub(r'\b0x[0-9a-fA-F]+\b', '<hex>', s)
+    s = re.sub(r'\b0x[0-9a-fA-F]+\b', '#', s)   # a hex number is a number as a decimal one is: a value printed with %#x reads 0 when it is zero ("x1=0" against "x1=0x1")
     s = re.sub(r'\b[0-9a-f]{16}\b', '<key>', s)
-    s = re.sub(r'\d+(\.\d+)?', '#', s).replace('<hex>', '0x#')
+    s = re.sub(r'\d+(\.\d+)?', '#', s)
     return s[:200]
+
+
+def red_kind(k):
+    """A [RED] kind as normalize_red makes it now: baselines stored before hex numbers became "#" hold them as "0x#\""""
+    return k.replace('0x#', '#')
 
 
 def read_log(text):
@@ -906,14 +911,14 @@ def smoke_diff(base, cand, route):
     for x in dict.fromkeys(cf_):
         (known if kind(x) in bf else newfail).append(x)
     d = {}
-    bred = set().union(*[r.get('red', {}).keys() for r in base]) if base else set()
+    bred = set(red_kind(k) for r in base for k in r.get('red', {})) if base else set()
     nr = collections.Counter()
     for r in cand:
         for k, n in r.get('red', {}).items():
-            if k not in bred: nr[k] += n
+            if red_kind(k) not in bred: nr[red_kind(k)] += n
     d['new_red'] = [{'text': k, 'count': n} for k, n in nr.most_common(30)]
     if nr: regress.append(f'{len(nr)} new [RED] line kinds')
-    gone = bred - set().union(*[r.get('red', {}).keys() for r in cand]) if cand else set()
+    gone = bred - set(red_kind(k) for r in cand for k in r.get('red', {})) if cand else set()
     if gone: changed.append(f'{len(gone)} [RED] line kinds gone'); d['gone_red'] = sorted(gone)[:30]
     def pct(k, invert=False):
         b, c = med(r.get(k) for r in base), med(r.get(k) for r in cand)
