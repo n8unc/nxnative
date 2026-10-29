@@ -31,6 +31,7 @@ Every piece of code that runs for one game and not the others: the rewriter's pa
 | [Pokémon Brilliant Diamond](#pokémon-brilliant-diamond) | 0 | 0 | 0 | 0 | 1 |  |
 | [Pokémon Scarlet](#pokémon-scarlet) | 1 | 0 | 0 | 0 | 0 | yes |
 | [SHIN MEGAMI TENSEI V: Vengeance](#shin-megami-tensei-v-vengeance) | 1 | 1 | 0 | 0 | 3 | yes |
+| [Subnautica](#subnautica) | 1 | 0 | 0 | 0 | 0 | yes |
 | [Subnautica: Below Zero](#subnautica-below-zero) | 1 | 0 | 0 | 0 | 0 | yes |
 | [Super Smash Bros. Ultimate](#super-smash-bros-ultimate) | 11 | 0 | 0 | 1 | 0 | yes |
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | yes |
@@ -459,6 +460,15 @@ Every piece of code that runs for one game and not the others: the rewriter's pa
   - host [hle_fpslock.c:58](../../dm/host/hle_fpslock.c#L58): engine frame limit set to fps_target: Unreal rhi.SyncInterval
   - host [hle_uemalloc.c:51](../../dm/host/hle_uemalloc.c#L51): Unreal's allocator on a host malloc zone
 
+### Subnautica
+
+[Subnautica](../../dm/games/0100429011144000/README.md), `0100429011144000`, [patches.py](../../dm/games/0100429011144000/patches.py).
+
+**Generalize?** Maybe: every Unity player constructs ALLOC_BUCKET the same way; a function-matched cut of its block count would need each Unity version's constructor call reviewed
+
+- **1.23.83358 `main`** `b3db5a1e…` ([patches.py:13](../../dm/games/0100429011144000/patches.py#L13))
+  - cut `+0x60ea64`: BucketAllocator ALLOC_BUCKET: at most 255 blocks of 4 MB (a 1 GB address region) → 63 (256 MB)
+
 ### Subnautica: Below Zero
 
 [Subnautica: Below Zero](../../dm/games/010014C011146000/README.md), `010014C011146000`, [patches.py](../../dm/games/010014C011146000/patches.py).
@@ -579,7 +589,7 @@ Cuts of Nintendo SDK `sdk` builds ([sdk_patches.py](../../dm/tools/sdk_patches.p
   - cut `+0x34e048`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x34e0e4`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
   - cut `+0x34e244`: AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)
-- **sdk** `2d369d99…` ([sdk_patches.py:34](../../dm/tools/sdk_patches.py#L34)): 13 Sentinels: Aegis Rim (Asia) 1.00, 13 Sentinels: Aegis Rim 1.10, Big Brain Academy: Brain vs. Brain 1.2.0, Metroid Dread 2.1.0, Monster Hunter Rise 16.0.2, Pokémon Brilliant Diamond 1.3.0
+- **sdk** `2d369d99…` ([sdk_patches.py:34](../../dm/tools/sdk_patches.py#L34)): 13 Sentinels: Aegis Rim (Asia) 1.00, 13 Sentinels: Aegis Rim 1.10, Big Brain Academy: Brain vs. Brain 1.2.0, Mario Party Superstars 1.1.1, Metroid Dread 2.1.0, Monster Hunter Rise 16.0.2, Pokémon Brilliant Diamond 1.3.0
   - cut `+0x34e0c8`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x34e164`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
 - **sdk** `56ec2474…` ([sdk_patches.py:43](../../dm/tools/sdk_patches.py#L43)): Fire Emblem Engage 2.0.0
@@ -610,7 +620,7 @@ Cuts of Nintendo SDK `sdk` builds ([sdk_patches.py](../../dm/tools/sdk_patches.p
 - **sdk** `9c73fb73…` ([sdk_patches.py:102](../../dm/tools/sdk_patches.py#L102)): Patrick's Parabox 1.0.1
   - cut `+0x37c3b0`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x37c44c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `3644a676…` ([sdk_patches.py:118](../../dm/tools/sdk_patches.py#L118)): AI: THE SOMNIUM FILES - nirvanA Initiative 1.0.2, Pokémon Scarlet 1.0.0, Subnautica: Below Zero 1.23.55063
+- **sdk** `3644a676…` ([sdk_patches.py:118](../../dm/tools/sdk_patches.py#L118)): AI: THE SOMNIUM FILES - nirvanA Initiative 1.0.2, Pokémon Scarlet 1.0.0, Subnautica 1.23.83358, Subnautica: Below Zero 1.23.55063
   - cut `+0x37c140`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x37c1dc`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
   - cut `+0x37c334`: AllocateAddressRegion: alignment of regions from 32 MB to 1 GB mov w11,#0x2000000 → mov w11,#0x200000 (2 MB, as SDK 20)
@@ -694,7 +704,7 @@ Dead code unless such a build is run; a candidate for removal, or for a build ro
 
 ## Translator rules keyed by a shader's code
 
-- [Program.cs:217](../../dm/gfx/tools/dmsh_xlate/Program.cs#L217): Tears of the Kingdom 1.4.3 visibility counter (one vertex shader, exact code SHA-256 below)
+- [Program.cs:219](../../dm/gfx/tools/dmsh_xlate/Program.cs#L219): Tears of the Kingdom 1.4.3 visibility counter (one vertex shader, exact code SHA-256 below)
 
 ## Profile switches
 
@@ -713,9 +723,9 @@ Profile keys (`game.tsv`) whose value changes what the host does, set away from 
 | `game_args -SwitchVirtualAddressSpaceSize=4064` | [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](../../dm/games/01006C300E9F0000/README.md), [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md), [FINAL FANTASY RESONANCE (Asian release)](../../dm/games/0100B8A026F14000/README.md) |
 | `gpu_timestamps segment` | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) |
 | `mem_map_limit on` | [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md), [Pokémon Scarlet](../../dm/games/0100A3D008C5C000/README.md), [Xenoblade Chronicles 3](../../dm/games/010074F013262000/README.md) |
+| `tex_dyn_slots on` | [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md), [FINAL FANTASY RESONANCE (Asian release)](../../dm/games/0100B8A026F14000/README.md), [OCTOPATH TRAVELER 0](../../dm/games/01005270232F2000/README.md) |
 | `game_args -SwitchVirtualAddressSpaceSize=2048` | [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md), [OCTOPATH TRAVELER 0](../../dm/games/01005270232F2000/README.md), [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md), [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md) |
 | `render_cond on` | [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md), [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md), [Mario vs. Donkey Kong](../../dm/games/0100B99019412000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) |
-| `tex_dyn_slots on` | [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md), [FINAL FANTASY RESONANCE (Asian release)](../../dm/games/0100B8A026F14000/README.md), [OCTOPATH TRAVELER 0](../../dm/games/01005270232F2000/README.md), [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) |
 | `alloc_big_align on` | [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md), [13 Sentinels: Aegis Rim (Asia)](../../dm/games/01008D7016438000/README.md), [13 Sentinels: Aegis Rim (Japan)](../../dm/games/010045C014650000/README.md), [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md), [Unicorn Overlord (Asia)](../../dm/games/010054B01AD92000/README.md) |
 | `feedback_snap (shader keys)` | [Captain Toad: Treasure Tracker](../../dm/games/01009BF0072D4000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [Paper Mario: The Origami King](../../dm/games/0100A3900C3E2000/README.md), [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md), [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) |
 | `present_interval display` | [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md), [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), [Monster Train 2](../../dm/games/010051701FB46000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) |
