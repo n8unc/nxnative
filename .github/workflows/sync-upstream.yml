@@ -1,0 +1,28 @@
+# Keeps the fork's main at parity with seedds/nxnative: GitHub's own "Sync fork"
+# (merge-upstream) fast-forwards, or makes a merge commit when the fork has its
+# own commits, so upstream's commits keep their SHAs. No pull request, so no
+# notifications; a run only emails when it fails (a conflict, or upstream gone).
+# GITHUB_TOKEN cannot write .github/workflows, which upstream changes often, so
+# the sync uses SYNC_TOKEN: a fine-grained token on this repository with
+# Contents and Workflows read/write.
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '19 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'n8unc/nxnative'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge seedds/nxnative main into main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main \
+            --jq '"\(.merge_type): \(.message)"'
