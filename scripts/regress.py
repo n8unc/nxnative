@@ -366,7 +366,7 @@ def chain_build(tree, g, a):
 
 
 def chain_build_locked(tree, g, a, v, inp, key, out):
-    tools, jobs = a.tools_fp, a.jobs
+    jobs = a.jobs
     mf = out / 'manifest.json'
     if mf.is_file():
         m = json.loads(mf.read_text()); m['secs'] = 0
